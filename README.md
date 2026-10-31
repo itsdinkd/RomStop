@@ -44,25 +44,12 @@ Download **[RomM-RomStop-Setup.exe](https://github.com/itsdinkd/RomStop/releases
 
 Use `ghcr.io/itsdinkd/romstop-romm:latest` in place of `rommapp/romm` in RomM's usual `docker-compose.yml`. Everything else about RomM stays the same. Optional settings are listed in [romm/README.md](romm/README.md#any-other-docker-host).
 
-## Also: EmulationStation DE and Knulli
-
-The same hack index works on handhelds and PCs without RomM. `romstop.py` adds a **RomStop** system to ES-DE (Windows, Steam Deck, Linux) or Knulli/Batocera. Browse hacks like games; launching one finds your base ROM by checksum, patches it and adds it to the console's game list. To install, drag the zip for your device onto your setup:
-
-| Device | Download |
-|---|---|
-| Windows (ES-DE) | [RomStop-ES-DE-Windows.zip](https://github.com/itsdinkd/RomStop/releases/latest/download/RomStop-ES-DE-Windows.zip) |
-| Steam Deck, SteamOS, Bazzite (ES-DE) | [RomStop-ES-DE-SteamDeck-Linux.zip](https://github.com/itsdinkd/RomStop/releases/latest/download/RomStop-ES-DE-SteamDeck-Linux.zip) |
-| Knulli, Batocera | [RomStop-Knulli-Batocera.zip](https://github.com/itsdinkd/RomStop/releases/latest/download/RomStop-Knulli-Batocera.zip) |
-
-Details are in [device/README.md](device/README.md).
-
 ## Repo layout
 
 | Folder | What it is |
 |---|---|
 | `romm/` | The RomM add-on: an overlay on RomM's source (`overlay/` + `romm.patch`), the Docker image, the Windows installer (`windows/`) and tests |
-| `device/` | The ES-DE / Knulli tool (`romstop.py`, Python 3.8+, stdlib only), cover art generator and tests |
-| `docs/architecture.md` | How both are built, the hack index format they read, and what to keep in sync |
+| `docs/architecture.md` | How it is built, the hack index format they read, and what to keep in sync |
 
 The hack index is built and published separately by the RomStop site. This repo only reads it.
 

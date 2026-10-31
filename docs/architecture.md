@@ -1,6 +1,6 @@
-# Integrations: ES-DE / Knulli tool and RomM add-on
+# RomStop: the RomM add-on
 
-Both read `device/index.json` published by the RomStop site (`format: 1`). The site, its hack data and the code that writes the index live in a separate, private repo; this repo only reads the index. Moved here from that repo on 2026-10-31. User-facing behavior is described in `device/README.md` and `romm/README.md`; this file covers how it is built and what to keep in sync.
+It reads `device/index.json` published by the RomStop site (`format: 1`). The site, its hack data and the code that writes the index live in a separate, private repo; this repo only reads the index. Moved here from that repo on 2026-10-31. User-facing behavior is described in `romm/README.md`; this file covers how it is built and what to keep in sync.
 
 ## The device index (contract)
 
@@ -16,18 +16,7 @@ The site build writes `<site>/device/index.json` with this shape. Any change to 
 ```
 
 - Patch `path`s are relative to the site root, or absolute R2 URLs. `noMirror` hacks list no patches.
-- Any field change or removal must be checked against `device/romstop.py` (`sync`, `hack_stubs`, `game_entry`, `get_patch`), `romm/overlay/backend/handler/romshelf/index.py` (`_prepare`, `_absolute`) and the RomM frontend types in `romm/overlay/frontend/src/services/api/romshelf.ts`. Adding optional fields is safe; bump `INDEX_FORMAT` (romstop.py) together with the site's index format for breaking changes.
-
-## ES-DE / Knulli tool (`device/`)
-
-- `device/romstop.py`: one stdlib-only file (about 1,260 lines) declaring Python 3.8+ as its minimum; CI tests it on 3.12 only . Commands: `setup`, `sync`, `install <entry.romstop>`, `remove`, `package` (used by the release workflow), internal `_reload`. Also built to `romstop.exe` with PyInstaller on Windows (`device.yml`).
-- Frontend detection: `Layout` / `detect_config` / `find_esde_home` / `is_batocera` find ES-DE (`~/ES-DE`, Windows `%APPDATA%`) or Batocera/Knulli (`/userdata`). `write_system_definition` adds a `romstop` system to `custom_systems/es_systems.xml` (existing file is kept, only the system block is added) or `es_systems_romstop.cfg`.
-- `sync`: downloads the index, creates one `.romstop` stub per hack under `<ROMs>/romstop/<console>/`, writes gamelist entries (`game_entry`, description with compatibility via `compat_lines`), covers via `device/covers.py` output (`media/`, Pillow, build time only).
-- `install` (on launch of a stub): `find_base_rom` hashes ROMs already on the device (`rom_candidates`; handles zips, SNES copier headers, NES iNES header, N64 byte orders via `variants`/`checksums`), `get_patch` fetches the mirrored patch (cached, crc32-checked) or uses a patch the user dropped into `<ROMs>/romstop/patches/<id>/`, `apply_patch` (own IPS/BPS/UPS implementation, mirrors the site's TypeScript patcher), writes `<Hack> (<version>) [RomStop].<ext>` into that console's ROM folder, updates the gamelist, then sets the per-game emulator from `hack.play` (`pick_emulator`; ES-DE `<altemulator>`, Batocera `batocera.conf` via `set_batocera_game_emulator`). Base ROMs are never downloaded.
-- Install-only hacks (`install`) are shown with their steps and are never auto-patched.
-- `package` builds drag-and-drop zips (ES-DE Windows, ES-DE Steam Deck/Linux, Knulli/Batocera) with "How to install.txt"; the owner wants to add to existing installs, not reinstall.
-- Tests: `device/test_romstop.py` (20 tests): `python3 -m unittest discover device`. CI also runs them on Windows and smoke-tests `romstop.exe setup` (`device.yml`).
-- The IPS/BPS/UPS code exists in both TypeScript (the site repo) and Python (`romstop.py`, and `romm` uses RomM's own `utils.rom_patcher`); fix patching bugs in each.
+- Any field change or removal must be checked against `romm/overlay/backend/handler/romshelf/index.py` (`_prepare`, `_absolute`) and the RomM frontend types in `romm/overlay/frontend/src/services/api/romshelf.ts`. Adding optional fields is safe; bump `INDEX_FORMAT` (romstop.py) together with the site's index format for breaking changes.
 
 ## RomM add-on (`romm/`)
 
@@ -59,4 +48,6 @@ RomM has no plugin system, so RomStop is an overlay on RomM source pinned to `ro
 
 ## Names kept from before the rename
 
-The project was called Romshelf. Internal names were kept so existing installs keep working: the `/api/romshelf` endpoints, the `handler/romshelf/` modules and their `romshelf/` data folder in RomM resources, Vue component names, and the `ROMSHELF_*` environment variables (still read when `ROMSTOP_*` are unset). Anything a user sees says RomStop. Hacks installed before the rename are tagged `[Romshelf]` and stay in a "Romshelf" collection; both are still recognized.
+The project was called Romshelf. Internal names were kept so existing installs keep working: the `/api/romshelf` endpoints, the `handler/romshelf/` modules and their `romshelf/` data folder in RomM resources, Vue component names, and the `ROMSHELF_*` environment variables (still read when `ROMSTOP_*` are unset). Anything a user sees says RomStop. Hacks installed before the rename are tagged `[Romshelf]` and stay in a "Romshelf" collection, which new installs keep using.
+
+The ES-DE / Knulli tool (`device/`) was removed for now on 2026-10-31; see the repo history.
