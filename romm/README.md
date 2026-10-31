@@ -1,5 +1,6 @@
 # RomStop for RomM
 
+*Note: **romShelf** in code represents the previous name for this project*
 Adds RomStop to [RomM](https://github.com/rommapp/romm) 5.4.1:
 
 - **A RomStop tab on every game page.** One collapsed row per hack made for that game. Opening a row shows the ROM the hack needs (green when the ROM you are on is the right one, red with the needed ROM's name when it is not, for example Mega Man 2 (Japan) when you are on the USA dump), the needed and your checksums, the version with a changelog button, the description, a screenshot gallery, ratings, authors and source links, and an **Install** button.
