@@ -1,5 +1,7 @@
 # RomStop for RomM
 
+This was built for my sole desire of having accessible rom hacks with 1 click patching to my current rom media. So why not have all rom hacks in one place, detecting which ones you can install vs cannot? This was 100% vibecoded with Claude through hundreds of prompts to ship out a great integration into RomM. 
+
 RomStop is an add-on for [RomM](https://github.com/rommapp/romm), the self-hosted ROM manager. It makes romhacking accessible: it shows every romhack in the RomStop index next to the games in your RomM library, tells you which ones you can install with the ROMs you already have, and installs a hack in one click as a new game in your library.
 
 You never have to find a patch, check a checksum or run a patcher by hand. RomStop never downloads or hosts ROMs. It only patches the ROMs that are already in your RomM library.
