@@ -6,6 +6,7 @@
 import { RBtn, RIcon, RTag } from "@v2/lib";
 import { computed, ref } from "vue";
 import { useI18n } from "vue-i18n";
+import type { RouteLocationRaw } from "vue-router";
 import type {
   RomshelfHack,
   RomshelfLibraryRom,
@@ -27,8 +28,10 @@ const props = withDefaults(
     versionLevels?: Record<string, RomshelfMatchLevel>;
     /** Only the needed ROM and checksums. */
     compact?: boolean;
+    /** The original game's page in this library, when it is there. */
+    romLink?: RouteLocationRaw | null;
   }>(),
-  { match: null, rom: null, versionLevels: () => ({}), compact: false },
+  { match: null, rom: null, versionLevels: () => ({}), compact: false, romLink: null },
 );
 
 defineSlots<{ default?: () => unknown }>();
@@ -180,7 +183,15 @@ const ratingText = computed(() => {
         <span class="r-v2-rs-hack__label">{{ t("romshelf.rom-needed") }}</span>
         <strong class="r-v2-rs-hack__need-title">{{ needTitle }}</strong>
         <span v-if="needState !== 'wrong'" class="r-v2-rs-hack__need-rom">
-          {{ needed }}
+          <RouterLink
+            v-if="romLink"
+            :to="romLink"
+            class="r-v2-rs-hack__need-link"
+            :title="t('romshelf.open-base-rom')"
+          >
+            {{ needed }}
+          </RouterLink>
+          <template v-else>{{ needed }}</template>
           <template v-if="base.revision"> · {{ base.revision }}</template>
           <template v-if="base.header"> · {{ base.header }}</template>
         </span>
@@ -385,6 +396,14 @@ const ratingText = computed(() => {
 }
 .r-v2-rs-hack__need--wrong .r-v2-rs-hack__need-icon {
   color: var(--r-color-danger);
+}
+.r-v2-rs-hack__need-link {
+  color: inherit;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+.r-v2-rs-hack__need-link:hover {
+  color: var(--r-color-brand-primary, var(--r-color-fg-heading));
 }
 .r-v2-rs-hack__need-text {
   display: flex;

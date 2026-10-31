@@ -9,7 +9,7 @@ import {
   RTag,
 } from "@v2/lib";
 import { computed, ref, watch } from "vue";
-import { useI18n } from "vue-i18n";
+import { Translation, useI18n } from "vue-i18n";
 import { useRoute } from "vue-router";
 import { ROUTES } from "@/plugins/routeNames";
 import romshelfApi, {
@@ -50,6 +50,13 @@ const fitting = computed(
 const otherVersions = computed(
   () => data.value?.matches.filter((m) => m.level === "wrong_version") ?? [],
 );
+// The original game in this library: the best match (matches come best
+// first), so the base game's name opens its RomM page. Even a wrong-version
+// dump is the same game. Null when the library doesn't have it.
+const baseRomLink = computed(() => {
+  const best = data.value?.matches[0];
+  return best ? { name: ROUTES.ROM, params: { rom: best.rom_id } } : null;
+});
 </script>
 
 <template>
@@ -73,7 +80,19 @@ const otherVersions = computed(
         <div>
           <h1 class="r-v2-rs-page__title">{{ hack.title }}</h1>
           <p class="r-v2-rs-page__sub">
-            {{ t("romshelf.hack-of", { game: hack.baseGame }) }}
+            <Translation keypath="romshelf.hack-of" tag="span" scope="global">
+              <template #game>
+                <RouterLink
+                  v-if="baseRomLink"
+                  :to="baseRomLink"
+                  class="r-v2-rs-page__base-link"
+                  :title="t('romshelf.open-base-rom')"
+                >
+                  {{ hack.baseGame }}
+                </RouterLink>
+                <template v-else>{{ hack.baseGame }}</template>
+              </template>
+            </Translation>
             <template v-if="hack.authors.length">
               · {{ hack.authors.join(", ") }}
             </template>
@@ -88,7 +107,7 @@ const otherVersions = computed(
       </header>
 
       <div class="r-v2-rs-page__body">
-        <HackDetails :hack="hack" :needed="data!.needed" />
+        <HackDetails :hack="hack" :needed="data!.needed" :rom-link="baseRomLink" />
 
         <aside class="r-v2-rs-page__roms">
           <h2 class="r-v2-rs-page__h2">{{ t("romshelf.your-roms") }}</h2>
@@ -180,6 +199,14 @@ const otherVersions = computed(
   margin: 0;
   color: var(--r-color-fg-secondary);
 }
+.r-v2-rs-page__base-link {
+  color: var(--r-color-fg-heading);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+.r-v2-rs-page__base-link:hover {
+  color: var(--r-color-brand-primary, var(--r-color-fg-heading));
+}
 .r-v2-rs-page__head-end {
   display: flex;
   flex-wrap: wrap;
@@ -216,7 +243,7 @@ const otherVersions = computed(
 .r-v2-rs-page__open {
   display: inline-block;
   margin-top: var(--r-space-3);
-  color: var(--r-color-brand-primary);
+  color: var(--r-color-brand-primary, var(--r-color-fg-heading));
   font-size: var(--r-font-size-sm);
 }
 html[data-bp~="sm-and-down"] .r-v2-rs-page {
