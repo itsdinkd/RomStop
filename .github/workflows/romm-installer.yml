@@ -1,0 +1,64 @@
+name: RomM Windows installer
+
+# Lints the Windows 11 installer scripts, dry-runs them, and builds RomM-RomStop-Setup.exe.
+on:
+  pull_request:
+    paths: ["romm/windows/**", ".github/workflows/romm-installer.yml"]
+  workflow_call:
+  workflow_dispatch:
+
+jobs:
+  installer:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: pwsh
+        working-directory: romm/windows
+    steps:
+      - uses: actions/checkout@v4
+      - name: Lint
+        run: |
+          Install-Module PSScriptAnalyzer -Force -Scope CurrentUser
+          $issues = Invoke-ScriptAnalyzer -Path . -Severity Error -Recurse
+          $issues | Format-Table -AutoSize
+          if ($issues) { exit 1 }
+      - name: Dry run in Windows PowerShell 5.1
+        shell: powershell
+        run: |
+          $dir = Join-Path $env:RUNNER_TEMP 'RomM'
+          $settings = Join-Path $env:RUNNER_TEMP 'settings.json'
+          '{"LibraryDir":"' + ($env:RUNNER_TEMP -replace '\\','\\') + '\\ROMs","Port":8099,"SCREENSCRAPER_USER":"me"}' | Set-Content $settings
+          .\Install-RomM.ps1 -InstallDir $dir -SettingsFile $settings -DryRun
+          if ($LASTEXITCODE) { Get-Content "$dir\install.log"; exit 1 }
+          if (Test-Path $settings) { throw 'settings file was not removed' }
+          $envText = Get-Content "$dir\.env" -Raw
+          if ($envText -notmatch 'ROMM_PORT=8099' -or $envText -notmatch 'SCREENSCRAPER_USER=me' -or $envText -notmatch 'DB_PASSWD=[0-9a-f]{64}') { $envText; throw 'bad .env' }
+          $first = (Select-String -Path "$dir\.env" -Pattern '^DB_PASSWD=(.*)$').Matches[0].Groups[1].Value
+          .\Install-RomM.ps1 -InstallDir $dir -DryRun
+          $second = (Select-String -Path "$dir\.env" -Pattern '^DB_PASSWD=(.*)$').Matches[0].Groups[1].Value
+          if ($first -ne $second) { throw 'a re-run changed the database password' }
+          if (-not (Test-Path "$env:RUNNER_TEMP\ROMs\roms\nes")) { throw 'library folders missing' }
+          docker compose -f "$dir\docker-compose.yml" --env-file "$dir\.env" config --quiet
+          if ($LASTEXITCODE) { throw 'compose file does not parse' }
+      - name: Programs that write to stderr do not stop the installer (Windows PowerShell 5.1)
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $LogFile = Join-Path $env:RUNNER_TEMP 'native.log'
+          $raw = Get-Content .\Install-RomM.ps1 -Raw
+          $i = $raw.IndexOf('function Invoke-Native'); $j = $raw.IndexOf('function Test-IsAdmin')
+          . ([scriptblock]::Create($raw.Substring($i, $j - $i)))
+          Invoke-Native { & cmd.exe /c "echo progress 1>&2 & exit /b 1378" }
+          if ($LASTEXITCODE -ne 1378) { throw "exit code was $LASTEXITCODE" }
+          if (-not (Select-String -Quiet progress $LogFile)) { throw 'stderr was not logged' }
+          # The runner fails a step whose last program exited non-zero; that 1378 was the point of the test.
+          exit 0
+      - name: Build the setup exe
+        run: |
+          choco install innosetup -y --no-progress
+          & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" "/DAppVersion=$(Get-Content ../ROMM_VERSION)" RomM-RomStop.iss
+          if ($LASTEXITCODE) { exit 1 }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: romm-installer
+          path: romm/windows/out/RomM-RomStop-Setup.exe

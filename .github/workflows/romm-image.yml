@@ -1,0 +1,58 @@
+name: RomM image
+
+# Tests the RomStop integration for RomM and builds the RomM + RomStop Docker image.
+# On main it is published to ghcr.io/itsdinkd/romstop-romm, which the Windows installer pulls.
+on:
+  pull_request:
+    paths: ["romm/**", ".github/workflows/romm-image.yml"]
+  push:
+    branches: [main]
+    paths: ["romm/**", ".github/workflows/romm-image.yml"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m unittest discover romm/tests
+      - id: v
+        run: echo "romm=$(cat romm/ROMM_VERSION)" >> "$GITHUB_OUTPUT"
+      - uses: docker/setup-buildx-action@v3
+      - if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@v6
+        with:
+          context: romm
+          build-args: ROMM_VERSION=${{ steps.v.outputs.romm }}
+          push: ${{ github.event_name != 'pull_request' }}
+          load: ${{ github.event_name == 'pull_request' }}
+          tags: |
+            ghcr.io/itsdinkd/romstop-romm:latest
+            ghcr.io/itsdinkd/romstop-romm:${{ steps.v.outputs.romm }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: Smoke test the image
+        if: github.event_name == 'pull_request'
+        run: |
+          docker network create romm-net
+          docker run -d --name romm-db --network romm-net -e MARIADB_ROOT_PASSWORD=root -e MARIADB_DATABASE=romm -e MARIADB_USER=romm-user -e MARIADB_PASSWORD=pw mariadb:11
+          sleep 20
+          docker run -d --name romm --network romm-net -p 8080:8080 -e DB_HOST=romm-db -e DB_NAME=romm -e DB_USER=romm-user -e DB_PASSWD=pw \
+            -e ROMM_AUTH_SECRET_KEY=$(openssl rand -hex 32) -e HASHEOUS_API_ENABLED=false ghcr.io/itsdinkd/romstop-romm:latest
+          for i in $(seq 1 60); do curl -sf localhost:8080/api/heartbeat >/dev/null && break; sleep 3; done
+          curl -sf localhost:8080/api/heartbeat >/dev/null || { docker logs romm; exit 1; }
+          code=$(curl -s -o /dev/null -w '%{http_code}' localhost:8080/api/romshelf/status)
+          [ "$code" = 401 ] || [ "$code" = 403 ] || { echo "romshelf endpoint answered $code"; exit 1; }
+          docker exec romm sh -c 'ls /var/www/html/assets/emulatorjs >/dev/null && grep -lq romshelf /var/www/html/assets/*.js'
