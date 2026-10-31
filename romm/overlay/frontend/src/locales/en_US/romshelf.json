@@ -84,6 +84,7 @@
   "older-version-hint": "RomStop has no download for this version. Download it from the hack's page and drop it here.",
   "open-download-page": "Open download page",
   "open-rom": "Open ROM",
+  "open-base-rom": "Open the original game in your library",
   "open-screenshot": "Open screenshot {n}",
   "patch-format": "Patch format",
   "patch-source": "Patch from {site}",
