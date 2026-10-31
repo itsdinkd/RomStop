@@ -1,12 +1,12 @@
 name: Release
 
-# Builds the downloads (ES-DE/Knulli tool and RomM Windows installer) and publishes them as a GitHub release.
+# Builds the RomM Windows installer and publishes it as a GitHub release.
 # The newest release is always at https://github.com/itsdinkd/RomStop/releases/latest/download/<file>,
-# which the README and the RomStop site link to.
+# which the README links to.
 on:
   push:
     branches: [main]
-    paths: ["device/**", "romm/windows/**", "romm/ROMM_VERSION", ".github/workflows/release.yml"]
+    paths: ["romm/windows/**", "romm/ROMM_VERSION", ".github/workflows/release.yml"]
   workflow_dispatch:
 
 permissions:
@@ -16,42 +16,23 @@ concurrency:
   group: release
 
 jobs:
-  device:
-    uses: ./.github/workflows/device.yml
-
   romm-installer:
     uses: ./.github/workflows/romm-installer.yml
 
   release:
-    needs: [device, romm-installer]
+    needs: [romm-installer]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
-          name: romstop-exe
-          path: out
-      - uses: actions/download-artifact@v4
-        with:
           name: romm-installer
           path: out
-      - run: cp device/romstop.py out/
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-      - run: pip install pillow==11.3.0
-      - name: Drag-and-drop zips for ES-DE and Knulli (hack list and covers as of now; the tool refreshes from the site)
-        run: |
-          site=$(python3 -c "import sys; sys.path.insert(0, 'device'); import romstop; print(romstop.DEFAULT_SITE)")
-          mkdir -p site/device
-          curl -fsSL "${site}device/index.json" -o site/device/index.json
-          python device/covers.py site/device/index.json site/device/media
-          python device/romstop.py package --index site/device/index.json --exe out/romstop.exe --site-root site --out out
       - name: Publish
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           tag="v$(date -u +%Y.%m.%d)-${GITHUB_RUN_NUMBER}"
-          gh release create "$tag" out/*.exe out/*.py out/*.zip \
+          gh release create "$tag" out/RomM-RomStop-Setup.exe \
             --target "$GITHUB_SHA" --title "RomStop $tag" --latest \
-            --notes "ES-DE/Knulli drag-and-drop zips and tool (romstop.exe for Windows, romstop.py for Linux/SteamOS/Knulli) and the RomM Windows installer, built from ${GITHUB_SHA::7}. The RomM image is ghcr.io/itsdinkd/romstop-romm:latest."
+            --notes "RomM Windows installer, built from ${GITHUB_SHA::7}. The RomM image is ghcr.io/itsdinkd/romstop-romm:latest."
