@@ -6,6 +6,7 @@ grid, scanlines, the hack's initials and its title. Needs Pillow (only at build 
 import json
 import re
 import sys
+from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 
 from PIL import Image, ImageChops, ImageDraw, ImageFont
@@ -95,13 +96,21 @@ def cover(hack, console):
     return img.convert("RGB")
 
 
+def _save(job):
+    hack, console, out = job
+    cover(hack, console).save(out / ("%s.png" % hack["id"]))
+
+
 def main(index_path, out_dir, media_prefix="device/media"):
     """Writes <out_dir>/<hack id>.png and records each as "cover" (a path relative to the site root) in the index."""
     idx = json.loads(Path(index_path).read_text(encoding="utf-8"))
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
+    # PNG compression is most of the time, so it is spread over the CPUs, at the default level: optimize=True
+    # made files about 15% smaller but saving 8x slower, too slow for the site build (~4,500 covers).
+    with ProcessPoolExecutor() as pool:
+        list(pool.map(_save, [(h, idx["consoles"].get(h["console"], {}), out) for h in idx["hacks"]], chunksize=32))
     for h in idx["hacks"]:
-        cover(h, idx["consoles"].get(h["console"], {})).save(out / ("%s.png" % h["id"]), optimize=True)
         h["cover"] = "%s/%s.png" % (media_prefix, h["id"])
     Path(index_path).write_text(json.dumps(idx), encoding="utf-8")
     print("%d covers in %s" % (len(idx["hacks"]), out))
