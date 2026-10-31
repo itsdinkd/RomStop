@@ -25,7 +25,7 @@ Use `ghcr.io/itsdinkd/romstop-romm:latest` instead of `rommapp/romm` in RomM's u
 
 | Variable | Default |
 | --- | --- |
-| `ROMSTOP_SITE_URL` | `https://itsdinkd.github.io/Romshelf/` |
+| `ROMSTOP_SITE_URL` | `https://romstop.pages.dev/` |
 | `ROMSTOP_INDEX_URL` | `<site>/device/index.json` (a `file://` path works too) |
 | `ROMSTOP_INDEX_TTL_SECONDS` | `600` |
 

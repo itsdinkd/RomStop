@@ -21,7 +21,7 @@ def _env(name: str, default: str) -> str:
     return os.environ.get(f"ROMSTOP_{name}") or os.environ.get(f"ROMSHELF_{name}") or default
 
 
-ROMSHELF_SITE_URL = _env("SITE_URL", "https://itsdinkd.github.io/Romshelf/").rstrip("/") + "/"
+ROMSHELF_SITE_URL = _env("SITE_URL", "https://romstop.pages.dev/").rstrip("/") + "/"
 ROMSHELF_INDEX_URL = _env("INDEX_URL", urljoin(ROMSHELF_SITE_URL, "device/index.json"))
 # How often to ask the site whether the index changed. The check is a conditional request (ETag /
 # Last-Modified), so it costs a few hundred bytes unless there is something new.
