@@ -44,7 +44,7 @@ RomM has no plugin system, so RomStop is an overlay on RomM source pinned to `ro
 - `Install-RomM.ps1`: enables WSL2 (restart code 3010, resumes by itself via a RunOnce registry entry / `-Resume`), installs Docker Desktop, writes a docker-compose project (`RomM` + `mariadb:11`) and `.env` (keeps existing passwords on re-run, so it doubles as repair/upgrade), pulls `ghcr.io/itsdinkd/romstop-romm:latest`, starts RomM (default `http://localhost:8080`) and creates shortcuts. Options: `-LibraryDir`, `-Port`, `-ScanWorkers` (`SCAN_WORKERS`, default 8), `-SettingsFile` (JSON, deleted after reading), `-DryRun`.
 - `Update-RomM.ps1` (pulls the newest image, or rebuilds `romstop-romm:local` from the repo), `Uninstall-RomM.ps1` (`-RemoveData`; never touches ROMs), `RomM-RomStop.iss` (Inno Setup wrapper, builds `RomM-RomStop-Setup.exe` in CI). Published by `release.yml` as a GitHub release asset.
 - Constraint: scripts must run in Windows PowerShell 5.1, and native programs that write to stderr must not abort the script (`Invoke-Native`; CI tests this). CI lints with PSScriptAnalyzer and dry-runs the installer.
-- The owner's PC is Windows (Legion Go 2). The installer is exercised only in CI; real-machine behavior is unverified from this repo.
+- The installer is exercised only in CI; real-machine behavior is unverified from this repo.
 
 ## Names kept from before the rename
 
