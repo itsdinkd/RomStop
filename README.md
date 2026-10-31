@@ -4,7 +4,7 @@ RomStop is an add-on for [RomM](https://github.com/rommapp/romm), the self-hoste
 
 You never have to find a patch, check a checksum or run a patcher by hand. RomStop never downloads or hosts ROMs. It only patches the ROMs that are already in your RomM library.
 
-![The RomStop page in RomM, showing hacks you can install right now](docs/screenshots/romstop-page.jpg)
+![The RomStop page in RomM: every hack for the games in your library, with a green check where your ROM fits](docs/screenshots/romstop-page.jpg)
 
 ## How it works
 
