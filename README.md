@@ -4,7 +4,7 @@ RomStop is an add-on for [RomM](https://github.com/rommapp/romm), the self-hoste
 
 You never have to find a patch, check a checksum or run a patcher by hand. RomStop never downloads or hosts ROMs. It only patches the ROMs that are already in your RomM library.
 
-> Screenshots are coming soon.
+![The RomStop page in RomM: every hack for the games in your library, with a green check where your ROM fits](docs/screenshots/romstop-page.jpg)
 
 ## How it works
 
@@ -27,6 +27,19 @@ You never have to find a patch, check a checksum or run a patcher by hand. RomSt
 - **Updates.** A badge appears when a newer version of an installed hack is out. There's a version picker and a Reinstall button.
 - **Emulator notes.** Hacks that don't work on some emulators are tagged, with the source page's own words.
 - **Import saves.** Bring your RetroArch, ES-DE or standalone emulator saves and save states into RomM. RomStop matches each one to the right game and never replaces anything already in RomM.
+
+### Screenshots
+
+| | |
+|---|---|
+| ![A game's RomStop tab listing its hacks](docs/screenshots/game-tab.jpg) | ![A hack's page in RomM: the ROM it needs, your matching ROM with Install, description, screenshots and credits](docs/screenshots/hack-details.jpg) |
+| A game's **RomStop** tab: every hack for it, with installed ones marked | A hack's page: the ROM it needs, your ROM that fits, and **Install** |
+| ![Roll a Rom Hack landing on a random hack](docs/screenshots/roll-a-rom-hack.jpg) | ![Installed hacks in the RomStop collection](docs/screenshots/collection.jpg) |
+| **Roll a Rom Hack** picks something you can install right now | Installed hacks are normal games in a **RomStop** collection |
+| ![An opened hack on a game's RomStop tab: ROM check and checksums](docs/screenshots/rom-check.jpg) | ![Import saves: each save matched to a game, with counts of what needs a game](docs/screenshots/import-saves-matching.jpg) |
+| The ROM check: which dump the hack needs, and whether yours matches | **Import saves** matches every save and state to a game in RomM |
+| ![Import saves: choosing the emulator and renaming a save to match the game](docs/screenshots/import-saves-emulator.jpg) | |
+| Pick the emulator a state belongs to, and rename saves to match RomM's file | |
 
 ### Examples
 
