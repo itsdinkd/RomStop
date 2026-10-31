@@ -1,0 +1,206 @@
+diff --git a/backend/main.py b/backend/main.py
+index 84036ba..d3afee8 100644
+--- a/backend/main.py
++++ b/backend/main.py
+@@ -53,6 +53,7 @@ from endpoints.play_sessions import router as play_sessions_router
+ from endpoints.recommendations import router as recommendations_router
+ from endpoints.responses.streaming import SOCKET_PAYLOADS as STREAMING_SOCKET_PAYLOADS
+ from endpoints.roms import router as rom_router
++from endpoints.romshelf import router as romshelf_router
+ from endpoints.saves import router as saves_router
+ from endpoints.screenshots import router as screenshots_router
+ from endpoints.search import router as search_router
+@@ -198,6 +199,7 @@ app.include_router(device_auth_router, prefix="/api")
+ app.include_router(play_sessions_router, prefix="/api")
+ app.include_router(platform_router, prefix="/api")
+ app.include_router(rom_router, prefix="/api")
++app.include_router(romshelf_router, prefix="/api")
+ app.include_router(recommendations_router, prefix="/api")
+ app.include_router(music_router, prefix="/api")
+ app.include_router(music_playlists_router, prefix="/api")
+diff --git a/frontend/e2e/support/pages.ts b/frontend/e2e/support/pages.ts
+index 80435ca..0a1d0cd 100644
+--- a/frontend/e2e/support/pages.ts
++++ b/frontend/e2e/support/pages.ts
+@@ -35,6 +35,8 @@ export const PAGES: Record<RouteName, PageDef> = {
+   [ROUTES.PLATFORMS_INDEX]: { open: "/platforms" },
+   [ROUTES.PLATFORM]: { open: gotoFirstPlatform },
+   [ROUTES.COLLECTIONS_INDEX]: { open: "/collections" },
++  [ROUTES.ROMSHELF]: { open: "/romstop" },
++  [ROUTES.ROMSHELF_HACK]: { skip: "needs a hack id from the RomStop index" },
+   [ROUTES.SEARCH]: { open: "/search" },
+   [ROUTES.MUSIC]: { open: "/music" },
+   [ROUTES.ROM]: { open: clickThroughToFirstRom },
+diff --git a/frontend/src/plugins/routeNames.ts b/frontend/src/plugins/routeNames.ts
+index ce1958f..263687e 100644
+--- a/frontend/src/plugins/routeNames.ts
++++ b/frontend/src/plugins/routeNames.ts
+@@ -46,6 +46,8 @@ export const ROUTES = {
+   CONSOLE_PLAY: "console-play",
+   PLATFORMS_INDEX: "platforms-index",
+   COLLECTIONS_INDEX: "collections-index",
++  ROMSHELF: "romshelf",
++  ROMSHELF_HACK: "romshelf-hack",
+   CONTROLLER_DEBUG: "controller-debug",
+   NOT_FOUND: "404",
+ } as const;
+diff --git a/frontend/src/plugins/router.ts b/frontend/src/plugins/router.ts
+index 8d93bbf..d200306 100644
+--- a/frontend/src/plugins/router.ts
++++ b/frontend/src/plugins/router.ts
+@@ -528,6 +528,25 @@ const routes = [
+           v2: v2For(ROUTES.COLLECTIONS_INDEX),
+         },
+       },
++      {
++        // RomStop: romhacks for the library (v2 only).
++        path: "romstop",
++        name: ROUTES.ROMSHELF,
++        meta: { title: "romshelf.title" },
++        components: {
++          default: () => import("@/views/Home.vue"),
++          v2: v2For(ROUTES.ROMSHELF),
++        },
++      },
++      {
++        path: "romstop/hack/:hack",
++        name: ROUTES.ROMSHELF_HACK,
++        meta: { title: "romshelf.title" },
++        components: {
++          default: () => import("@/views/Home.vue"),
++          v2: v2For(ROUTES.ROMSHELF_HACK),
++        },
++      },
+       {
+         path: ":pathMatch(.*)*",
+         name: ROUTES.NOT_FOUND,
+diff --git a/frontend/src/v2/composables/useNavDestinations/index.ts b/frontend/src/v2/composables/useNavDestinations/index.ts
+index 57a34bd..464b822 100644
+--- a/frontend/src/v2/composables/useNavDestinations/index.ts
++++ b/frontend/src/v2/composables/useNavDestinations/index.ts
+@@ -1,5 +1,5 @@
+-// useNavDestinations: single source of truth for the four primary
+-// content destinations (Home / Platforms / Collections / Search) and the
++// useNavDestinations: single source of truth for the primary
++// content destinations (Home / Platforms / Collections / RomStop / Search) and the
+ // route-path → active-tab derivation. Shared by `AppNav` (desktop top
+ // pill) and `BottomNav` (mobile bottom bar) so the two never drift in
+ // labels, icons, ordering, or active-state logic.
+@@ -12,7 +12,12 @@ import type { ComputedRef } from "vue";
+ import { useI18n } from "vue-i18n";
+ import { useRoute } from "vue-router";
+ 
+-export type NavDestinationId = "home" | "platforms" | "collections" | "search";
++export type NavDestinationId =
++  | "home"
++  | "platforms"
++  | "collections"
++  | "romshelf"
++  | "search";
+ 
+ export interface NavDestination {
+   id: NavDestinationId;
+@@ -29,6 +34,7 @@ export const NAV_TARGETS: readonly { id: NavDestinationId; to: string }[] = [
+   { id: "home", to: "/" },
+   { id: "platforms", to: "/platforms" },
+   { id: "collections", to: "/collections" },
++  { id: "romshelf", to: "/romstop" },
+   { id: "search", to: "/search" },
+ ];
+ 
+@@ -38,6 +44,7 @@ const NAV_META: Record<NavDestinationId, { labelKey: string; icon: string }> = {
+   // Same glyph GameCard uses for its "add to collection" action:
+   // keeps the icon stable across every generic "Collections" surface.
+   collections: { labelKey: "common.collections", icon: "mdi-bookmark-outline" },
++  romshelf: { labelKey: "romshelf.title", icon: "mdi-bookshelf" },
+   search: { labelKey: "common.search", icon: "mdi-magnify" },
+ };
+ 
+@@ -55,6 +62,7 @@ export function navDestinationAt(path: string): NavDestinationId | null {
+   if (isUnder(path, "/collections") || isUnder(path, "/collection")) {
+     return "collections";
+   }
++  if (isUnder(path, "/romstop")) return "romshelf";
+   if (isUnder(path, "/search")) return "search";
+   return null;
+ }
+diff --git a/frontend/src/v2/router/routes.ts b/frontend/src/v2/router/routes.ts
+index 3b21eff..bdba421 100644
+--- a/frontend/src/v2/router/routes.ts
++++ b/frontend/src/v2/router/routes.ts
+@@ -72,6 +72,8 @@ export const v2RouteComponents: Partial<Record<RouteName, V2Route>> = {
+   // V2-only index pages (no v1 equivalent: the v1 UI uses its drawer)
+   [ROUTES.PLATFORMS_INDEX]: () => import("@/v2/views/PlatformsIndex.vue"),
+   [ROUTES.COLLECTIONS_INDEX]: () => import("@/v2/views/CollectionsIndex.vue"),
++  [ROUTES.ROMSHELF]: () => import("@/v2/views/Romshelf/RomshelfIndex.vue"),
++  [ROUTES.ROMSHELF_HACK]: () => import("@/v2/views/Romshelf/RomshelfHack.vue"),
+   // V2-only dev tool: live gamepad input inspector.
+   [ROUTES.CONTROLLER_DEBUG]: () => import("@/v2/views/ControllerDebug.vue"),
+   // v1-only easter egg: no v2 component links here, so the URL is a dead end.
+diff --git a/frontend/src/v2/views/GameDetails.vue b/frontend/src/v2/views/GameDetails.vue
+index a486818..6718a75 100644
+--- a/frontend/src/v2/views/GameDetails.vue
++++ b/frontend/src/v2/views/GameDetails.vue
+@@ -13,6 +13,7 @@ import { onBeforeRouteUpdate, useRoute, useRouter } from "vue-router";
+ import type { IGDBRelatedGame, SimilarRomSchema } from "@/__generated__";
+ import { useUISettings } from "@/composables/useUISettings";
+ import romApi from "@/services/api/rom";
++import romshelfApi from "@/services/api/romshelf";
+ import { pendingAssetKinds } from "@/services/pending-asset";
+ import storeAuth from "@/stores/auth";
+ import storeRoms from "@/stores/roms";
+@@ -30,6 +31,7 @@ import OverviewTab from "@/v2/components/GameDetails/OverviewTab.vue";
+ import PatcherTab from "@/v2/components/GameDetails/PatcherTab.vue";
+ import PrevNextNav from "@/v2/components/GameDetails/PrevNextNav.vue";
+ import SaveDataTab from "@/v2/components/GameDetails/SaveDataTab.vue";
++import RomshelfTab from "@/v2/components/Romshelf/RomshelfTab.vue";
+ import { useBackgroundArt } from "@/v2/composables/useBackgroundArt";
+ import { useBreakpoint } from "@/v2/composables/useBreakpoint";
+ import { useIsAlive } from "@/v2/composables/useIsAlive";
+@@ -309,6 +311,22 @@ const saveDataCount = computed(() => savesCount.value + statesCount.value);
+ 
+ const filesCount = computed(() => currentRom.value?.files?.length ?? 0);
+ 
++// The RomStop tab badge counts the hacks made for this game.
++const romshelfCount = ref<number | null>(null);
++watch(
++  () => currentRom.value?.id,
++  async (id) => {
++    romshelfCount.value = null;
++    if (!id) return;
++    try {
++      romshelfCount.value = (await romshelfApi.getRomHacks(id)).data.hacks.length;
++    } catch {
++      romshelfCount.value = null;
++    }
++  },
++  { immediate: true },
++);
++
+ // The patcher tab is always available: a base game file can be patched with
+ // one of the ROM's bundled patch files or with a patch uploaded from disk, so
+ // users don't have to store patches in the library until they need them.
+@@ -331,6 +349,11 @@ const tabs = computed<RTabNavItem[]>(() => [
+     label: t("rom.save-data"),
+     badge: saveDataCount.value,
+   },
++  {
++    id: "romshelf",
++    label: t("romshelf.tab"),
++    ...(romshelfCount.value ? { badge: romshelfCount.value } : {}),
++  },
+   { id: "patcher", label: t("common.patcher") },
+   { id: "metadata", label: t("rom.metadata") },
+ ]);
+@@ -397,6 +420,11 @@ const activeTab = computed({
+             :earned-achievement-ids="earnedAchievementIds"
+           />
+           <SaveDataTab v-if="activeTab === 'save-data'" :rom="currentRom" />
++          <RomshelfTab
++            v-if="activeTab === 'romshelf'"
++            :rom="currentRom"
++            @count="romshelfCount = $event"
++          />
+           <PatcherTab v-if="activeTab === 'patcher'" :rom="currentRom" />
+           <MetadataTab v-if="activeTab === 'metadata'" :rom="currentRom" />
+         </div>
