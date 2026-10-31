@@ -4,7 +4,7 @@ RomStop is an add-on for [RomM](https://github.com/rommapp/romm), the self-hoste
 
 You never have to find a patch, check a checksum or run a patcher by hand. RomStop never downloads or hosts ROMs. It only patches the ROMs that are already in your RomM library.
 
-> Screenshots are coming soon.
+![The RomStop page in RomM, showing hacks you can install right now](docs/screenshots/romstop-page.jpg)
 
 ## How it works
 
@@ -27,6 +27,15 @@ You never have to find a patch, check a checksum or run a patcher by hand. RomSt
 - **Updates.** A badge appears when a newer version of an installed hack is out. There's a version picker and a Reinstall button.
 - **Emulator notes.** Hacks that don't work on some emulators are tagged, with the source page's own words.
 - **Import saves.** Bring your RetroArch, ES-DE or standalone emulator saves and save states into RomM. RomStop matches each one to the right game and never replaces anything already in RomM.
+
+### Screenshots
+
+| | |
+|---|---|
+| ![A game's RomStop tab listing its hacks](docs/screenshots/game-tab.jpg) | ![A hack's details: right ROM check, checksums, changelog, screenshots and Install](docs/screenshots/hack-details.jpg) |
+| A game's **RomStop** tab: every hack for it, with installed ones marked | A hack opened: ROM check, version, screenshots, credits and **Install** |
+| ![Roll a Rom Hack landing on a random hack](docs/screenshots/roll-a-rom-hack.jpg) | ![Installed hacks in the RomStop collection](docs/screenshots/collection.jpg) |
+| **Roll a Rom Hack** picks something you can install right now | Installed hacks are normal games in a **RomStop** collection |
 
 ### Examples
 
