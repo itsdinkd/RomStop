@@ -32,8 +32,8 @@ You never have to find a patch, check a checksum or run a patcher by hand. RomSt
 
 | | |
 |---|---|
-| ![A game's RomStop tab listing its hacks](docs/screenshots/game-tab.jpg) | ![A hack's details: right ROM check, checksums, changelog, screenshots and Install](docs/screenshots/hack-details.jpg) |
-| A game's **RomStop** tab: every hack for it, with installed ones marked | A hack opened: ROM check, version, screenshots, credits and **Install** |
+| ![A game's RomStop tab listing its hacks](docs/screenshots/game-tab.jpg) | ![A hack's page in RomM: the ROM it needs, your matching ROM with Install, description, screenshots and credits](docs/screenshots/hack-details.jpg) |
+| A game's **RomStop** tab: every hack for it, with installed ones marked | A hack's page: the ROM it needs, your ROM that fits, and **Install** |
 | ![Roll a Rom Hack landing on a random hack](docs/screenshots/roll-a-rom-hack.jpg) | ![Installed hacks in the RomStop collection](docs/screenshots/collection.jpg) |
 | **Roll a Rom Hack** picks something you can install right now | Installed hacks are normal games in a **RomStop** collection |
 
