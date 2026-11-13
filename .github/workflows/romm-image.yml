@@ -22,6 +22,8 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      # test_ftp: the password is encrypted with the library RomM uses; pyftpdlib is a real FTP server to send to.
+      - run: pip install "cryptography>=49,<51" pyftpdlib
       - run: python -m unittest discover romm/tests
       - id: v
         run: echo "romm=$(cat romm/ROMM_VERSION)" >> "$GITHUB_OUTPUT"

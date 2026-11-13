@@ -12,8 +12,9 @@ import {
   RSelect,
   RSpinner,
 } from "@v2/lib";
-import { computed, onBeforeUnmount, ref, watch } from "vue";
+import { computed, nextTick, onBeforeUnmount, ref, watch } from "vue";
 import { useI18n } from "vue-i18n";
+import { useUserLocalStorage } from "@/composables/useUserLocalStorage";
 import { ROUTES } from "@/plugins/routeNames";
 import romshelfApi, {
   installErrorOf,
@@ -26,6 +27,8 @@ import romshelfApi, {
 import { useCan } from "@/v2/composables/useCan";
 import { useSnackbar } from "@/v2/composables/useSnackbar";
 import { browserCoreFor, rememberHackCore } from "@/v2/components/Romshelf/compat";
+import { useFtpStatus } from "@/v2/components/Romshelf/ftp";
+import SendFtpButton from "@/v2/components/Romshelf/SendFtpButton.vue";
 
 const props = defineProps<{
   hack: RomshelfHack;
@@ -80,6 +83,14 @@ const fileId = ref<number | null>(
   props.defaultFileId ?? props.files[0]?.id ?? null,
 );
 const installAnyway = ref(false);
+// Remembered per user: installs go to <platform>/Hacks/ (the backend creates it) instead of next to the games.
+const hacksFolder = useUserLocalStorage("romstop.install.hacksFolder", false);
+// Send with FTP (set up by an admin): push the installed hack to the device right after installing it.
+const ftp = useFtpStatus();
+const sendAfterInstall = useUserLocalStorage("romstop.install.sendFtp", false);
+const ftpButton = ref<InstanceType<typeof SendFtpButton> | null>(null);
+const justInstalledRomId = ref<number | null>(null);
+const ftpRomId = computed(() => installedHere.value?.rom_id ?? justInstalledRomId.value);
 const patchFile = ref<File | null>(null);
 const patchMember = ref<string | null>(null);
 const installing = ref(false);
@@ -185,6 +196,7 @@ async function submit(replace = false) {
       patchFile: patchFile.value,
       patchMember: patchMember.value,
       replace: replace || previousCode === "already_installed",
+      hacksFolder: hacksFolder.value,
     });
     if (!data.checksum_validated) {
       snackbar.warning(t("romshelf.checksum-warning"), { timeout: 6000 });
@@ -211,6 +223,11 @@ async function checkInstall(attempt: number) {
       if (props.platformSlug) rememberHackCore(data.rom_id, props.platformSlug, props.hack);
       pendingRecord.value = null;
       patchFile.value = null;
+      justInstalledRomId.value = data.rom_id;
+      if (sendAfterInstall.value && ftp.value.enabled) {
+        await nextTick();
+        void ftpButton.value?.send();
+      }
       snackbar.success(
         t("romshelf.installed-toast", { title: props.hack.title }),
         {
@@ -439,6 +456,23 @@ function onFiles(files: File[]) {
       />
     </div>
 
+    <!-- A replaced install stays in the folder it is already in. -->
+    <RCheckbox
+      v-if="!installedHere"
+      v-model="hacksFolder"
+      :label="t('romshelf.hacks-folder')"
+      :disabled="installing || !!pendingRecord"
+      hide-details
+    />
+
+    <RCheckbox
+      v-if="ftp.enabled && canInstall"
+      v-model="sendAfterInstall"
+      :label="t('romshelf.ftp-after-install', { target: ftp.name })"
+      :disabled="installing || !!pendingRecord"
+      hide-details
+    />
+
     <div class="r-v2-rs-install__actions">
       <RBtn
         :variant="installedHere ? 'outlined' : 'flat'"
@@ -474,6 +508,12 @@ function onFiles(files: File[]) {
           </li>
         </template>
       </RSelect>
+      <SendFtpButton
+        v-if="ftpRomId && !pendingRecord"
+        ref="ftpButton"
+        :rom-id="ftpRomId"
+        :title="hack.title"
+      />
       <span v-if="pendingRecord" class="r-v2-rs-install__pending">
         <RSpinner :size="14" />
         {{ t("romshelf.adding-to-library") }}

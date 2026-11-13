@@ -17,12 +17,14 @@ from sqlalchemy.orm import selectinload
 from decorators.auth import protected_route
 from endpoints.sockets.scan import ScanPayload, queue_scan
 from handler.auth.constants import Scope
-from handler.auth.dependencies import get_permissions
+from handler.auth.dependencies import assert_admin, get_permissions
 from handler.database import db_rom_handler, db_save_handler, db_state_handler
 from handler.database.base_handler import sync_session
-from handler.filesystem import fs_asset_handler
+from config.config_manager import ROMSTOP_HACKS_FOLDER
+from handler.filesystem import fs_asset_handler, fs_rom_handler
 from handler.redis_handler import low_prio_queue
 from handler.romshelf import counters as romshelf_counters
+from handler.romshelf import ftp as romshelf_ftp
 from handler.romshelf import index as romshelf_index
 from handler.romshelf import installs as romshelf_installs
 from handler.romshelf import modpatch as romshelf_modpatch
@@ -389,6 +391,7 @@ async def install_hack(
     patch_member: Annotated[str | None, Form(description="Which patch to use when the download holds several.")] = None,
     archive_member: Annotated[str | None, Form(description="File inside a ZIP ROM to patch.")] = None,
     replace: Annotated[bool, Form()] = False,
+    hacks_folder: Annotated[bool, Form(description='Save the hack in a "Hacks" folder inside the platform folder.')] = False,
     patch_file: Annotated[UploadFile | None, File(description="The patch or its archive, when the site needs a browser download.")] = None,
 ) -> dict[str, Any]:
     """Download the hack's patch, apply it to one of this ROM's files and add the result to the library as a new ROM.
@@ -424,7 +427,7 @@ async def install_hack(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail={"message": f"{rom_file.file_name} is missing from disk.", "code": "missing_file"})
 
     if method:
-        return await _install_mod(request, hack, chosen, base_rom, rom_file, patch_file, replace, m)
+        return await _install_mod(request, hack, chosen, base_rom, rom_file, patch_file, replace, m, hacks_folder)
 
     work = Path(tempfile.mkdtemp(prefix="romshelf_patch_"))
     try:
@@ -445,6 +448,7 @@ async def install_hack(
             user_id=request.user.id,
             archive_member=archive_member,
             replace=replace,
+            hacks_folder=hacks_folder,
         )
     except (PatchSourceError, romshelf_installs.InstallError) as exc:
         raise _error(exc) from exc
@@ -461,7 +465,7 @@ async def install_hack(
     return {**_install_json(record), "needed": needed_rom_label(hack, base), "match": m.level.value}
 
 
-async def _install_mod(request: Request, hack: dict[str, Any], chosen: dict[str, Any] | None, base_rom: Any, rom_file: Any, patch_file: UploadFile | None, replace: bool, m: Match) -> dict[str, Any]:
+async def _install_mod(request: Request, hack: dict[str, Any], chosen: dict[str, Any] | None, base_rom: Any, rom_file: Any, patch_file: UploadFile | None, replace: bool, m: Match, hacks_folder: bool = False) -> dict[str, Any]:
     """Wii Riivolution / Vita rePatch: fetch the mod package and lay it over the game (see handler/romshelf/modpatch.py)."""
     work = Path(tempfile.mkdtemp(prefix="romshelf_modsrc_"))
     try:
@@ -470,7 +474,7 @@ async def _install_mod(request: Request, hack: dict[str, Any], chosen: dict[str,
         else:
             package = await _fetch_first(patch_urls(hack, chosen), work)
         record = await romshelf_installs.install_mod(
-            hack=hack, version=chosen, rom_file=rom_file, base_rom=base_rom, package=package, user_id=request.user.id, replace=replace
+            hack=hack, version=chosen, rom_file=rom_file, base_rom=base_rom, package=package, user_id=request.user.id, replace=replace, hacks_folder=hacks_folder
         )
     except (PatchSourceError, romshelf_installs.InstallError) as exc:
         raise _error(exc) from exc
@@ -499,6 +503,83 @@ async def get_install(request: Request, record_id: Annotated[str, PathVar()]) ->
     if not record:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Install not found")
     return _install_json(record)
+
+
+# ---------------------------------------------------------------- Send with FTP
+# An admin sets up one FTP target (say a PS5's FTP payload next to RetroArch); anyone who may install hacks can
+# then push a library game to it. The password stays on the server (handler/romshelf/ftp.py).
+
+
+def _ftp_error(exc: romshelf_ftp.FtpError) -> HTTPException:
+    return HTTPException(status_code=exc.status, detail={"message": str(exc), "code": exc.code})
+
+
+@protected_route(router.get, "/ftp/status", [Scope.ROMS_READ])
+async def ftp_status(request: Request) -> dict[str, Any]:
+    """Whether Send with FTP is on, and the target's name for the button."""
+    return romshelf_ftp.status()
+
+
+@protected_route(router.get, "/ftp/settings", [Scope.ROMS_WRITE])
+async def get_ftp_settings(request: Request) -> dict[str, Any]:
+    """The FTP settings for the admin form (never the password) and the presets."""
+    assert_admin(request)
+    return {"settings": romshelf_ftp.public(), "presets": list(romshelf_ftp.iter_presets()), "hacks_folder": ROMSTOP_HACKS_FOLDER}
+
+
+@protected_route(router.put, "/ftp/settings", [Scope.ROMS_WRITE])
+async def put_ftp_settings(request: Request, payload: Annotated[dict[str, Any], Body()]) -> dict[str, Any]:
+    """Save the FTP settings. Leave `password` out to keep the saved one; `clear_password` removes it."""
+    assert_admin(request)
+    try:
+        return {"settings": await asyncio.to_thread(romshelf_ftp.save, payload)}
+    except romshelf_ftp.FtpError as exc:
+        raise _ftp_error(exc) from exc
+
+
+@protected_route(router.post, "/ftp/test", [Scope.ROMS_WRITE])
+async def test_ftp(request: Request, payload: Annotated[dict[str, Any] | None, Body()] = None) -> dict[str, Any]:
+    """Sign in with the form's settings (unsaved changes included) and list the base path's folders."""
+    assert_admin(request)
+    try:
+        settings = romshelf_ftp.merged(payload or {})
+        return await asyncio.to_thread(romshelf_ftp.test, settings)
+    except romshelf_ftp.FtpError as exc:
+        raise _ftp_error(exc) from exc
+
+
+@protected_route(router.post, "/ftp/send", [Scope.ROMS_WRITE])
+async def send_ftp(request: Request, rom_id: Annotated[int, Body(embed=True, ge=1)]) -> dict[str, Any]:
+    """Send a library game (an installed hack, or any ROM) to the FTP target. Returns a job to poll."""
+    rom = db_rom_handler.get_rom(rom_id)
+    if not rom or not get_permissions(request).can_see_rom(rom):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"ROM {rom_id} not found")
+    settings = romshelf_ftp.load()
+    if not settings["enabled"] or not settings["host"]:
+        raise _ftp_error(romshelf_ftp.FtpError("Send with FTP is off. An admin can turn it on under Settings > Send with FTP.", "not_configured"))
+    running = romshelf_ftp.running_for(rom_id)
+    if running:
+        return running
+    try:
+        local = fs_rom_handler.validate_path(rom.full_path)
+        in_hacks = PurePosixPath(rom.fs_path).name == ROMSTOP_HACKS_FOLDER
+        dest = romshelf_ftp.remote_dir(settings, rom.platform.fs_slug, in_hacks)
+        uploads = await asyncio.to_thread(romshelf_ftp.plan, local, dest)
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail={"message": str(exc), "code": "bad_path"}) from exc
+    except romshelf_ftp.FtpError as exc:
+        raise _ftp_error(exc) from exc
+    log.info(f"RomStop: sending {rom.fs_name} to {romshelf_ftp.target_name(settings)} ({dest})")
+    return await asyncio.to_thread(romshelf_ftp.start, settings, uploads, rom_id=rom_id, user_id=request.user.id, dest=dest)
+
+
+@protected_route(router.get, "/ftp/jobs/{job_id}", [Scope.ROMS_READ])
+async def get_ftp_job(request: Request, job_id: Annotated[str, PathVar()]) -> dict[str, Any]:
+    """A transfer's progress: status running / done / failed, bytes done of total."""
+    found = await asyncio.to_thread(romshelf_ftp.job, job_id)
+    if not found:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Transfer not found")
+    return found
 
 
 # ---------------------------------------------------------------- save import

@@ -1,3 +1,56 @@
+diff --git a/backend/config/config_manager.py b/backend/config/config_manager.py
+index d763ad2..9feff25 100644
+--- a/backend/config/config_manager.py
++++ b/backend/config/config_manager.py
+@@ -247,6 +247,32 @@ def parse_platform_templates(
+     )
+ 
+ 
++# RomStop: romhacks can be installed into a "Hacks" folder inside the platform's
++# games folder (roms/snes/Hacks/<hack>.sfc). Without its own layout that folder
++# would read as one multi-file game; with it, each file or folder in it is a game.
++ROMSTOP_HACKS_FOLDER: Final = "Hacks"
++
++
++def with_hacks_folder(
++    templates: tuple[StructureTemplate, ...],
++) -> tuple[StructureTemplate, ...]:
++    """Add a `<games dir>/Hacks/{game}` layout after each fully literal one.
++
++    Appended last, so uploads keep landing where they did; the folder then counts
++    as a grouping level and is no longer surfaced as a multi-file game itself.
++    """
++    extra = [
++        StructureTemplate(
++            platform_dir=template.platform_dir,
++            levels=(*template.levels, StructureLevel(literal=ROMSTOP_HACKS_FOLDER)),
++        )
++        for template in templates
++        if not template.has_wildcard_levels
++        and ROMSTOP_HACKS_FOLDER not in [level.literal for level in template.levels]
++    ]
++    return templates + tuple(t for t in extra if t not in templates)
++
++
+ def _platform_first_layout(folder: str) -> bool | None:
+     """Whether the library keeps `folder` inside each platform folder.
+ 
+@@ -580,9 +606,12 @@ class Config:
+             if key in RESERVED_STRUCTURE_KEYS
+             else self.STRUCTURE_TEMPLATES.get(key)
+         )
+-        if not value:
+-            return (self.default_structure,)
+-        return parse_platform_templates(value, fs_slug=key)
++        templates = (
++            parse_platform_templates(value, fs_slug=key)
++            if value
++            else (self.default_structure,)
++        )
++        return with_hacks_folder(templates)
+ 
+     @functools.cached_property
+     def platforms_dir(self) -> str:
 diff --git a/backend/main.py b/backend/main.py
 index 84036ba..d3afee8 100644
 --- a/backend/main.py
@@ -19,36 +72,66 @@ index 84036ba..d3afee8 100644
  app.include_router(music_router, prefix="/api")
  app.include_router(music_playlists_router, prefix="/api")
 diff --git a/frontend/e2e/support/pages.ts b/frontend/e2e/support/pages.ts
-index 80435ca..0a1d0cd 100644
+index 80435ca..c11d3a8 100644
 --- a/frontend/e2e/support/pages.ts
 +++ b/frontend/e2e/support/pages.ts
-@@ -35,6 +35,8 @@ export const PAGES: Record<RouteName, PageDef> = {
+@@ -35,6 +35,9 @@ export const PAGES: Record<RouteName, PageDef> = {
    [ROUTES.PLATFORMS_INDEX]: { open: "/platforms" },
    [ROUTES.PLATFORM]: { open: gotoFirstPlatform },
    [ROUTES.COLLECTIONS_INDEX]: { open: "/collections" },
 +  [ROUTES.ROMSHELF]: { open: "/romstop" },
 +  [ROUTES.ROMSHELF_HACK]: { skip: "needs a hack id from the RomStop index" },
++  [ROUTES.ROMSTOP_FTP]: { open: "/romstop-ftp" },
    [ROUTES.SEARCH]: { open: "/search" },
    [ROUTES.MUSIC]: { open: "/music" },
    [ROUTES.ROM]: { open: clickThroughToFirstRom },
 diff --git a/frontend/src/plugins/routeNames.ts b/frontend/src/plugins/routeNames.ts
-index ce1958f..263687e 100644
+index ce1958f..a0b8229 100644
 --- a/frontend/src/plugins/routeNames.ts
 +++ b/frontend/src/plugins/routeNames.ts
-@@ -46,6 +46,8 @@ export const ROUTES = {
+@@ -46,6 +46,9 @@ export const ROUTES = {
    CONSOLE_PLAY: "console-play",
    PLATFORMS_INDEX: "platforms-index",
    COLLECTIONS_INDEX: "collections-index",
 +  ROMSHELF: "romshelf",
 +  ROMSHELF_HACK: "romshelf-hack",
++  ROMSTOP_FTP: "romstop-ftp",
    CONTROLLER_DEBUG: "controller-debug",
    NOT_FOUND: "404",
  } as const;
+@@ -63,6 +66,7 @@ export const ROUTE_SCOPES: Partial<Record<RouteName, readonly string[]>> = {
+   [ROUTES.CONVERSION_SETTINGS]: ["platforms.write"],
+   [ROUTES.ADMINISTRATION]: ["users.write"],
+   [ROUTES.LOGS]: ["logs.read"],
++  [ROUTES.ROMSTOP_FTP]: ["users.write"],
+ };
+ 
+ const authExemptRoutes = [
 diff --git a/frontend/src/plugins/router.ts b/frontend/src/plugins/router.ts
-index 8d93bbf..d200306 100644
+index 8d93bbf..7be9a1e 100644
 --- a/frontend/src/plugins/router.ts
 +++ b/frontend/src/plugins/router.ts
-@@ -528,6 +528,25 @@ const routes = [
+@@ -415,6 +415,19 @@ const routes = [
+               v2: v2For(ROUTES.CONVERSION_SETTINGS),
+             },
+           },
++          {
++            // RomStop: Send with FTP (admins; v2 only).
++            path: "romstop-ftp",
++            name: ROUTES.ROMSTOP_FTP,
++            meta: {
++              title: "romshelf.ftp-title",
++              bare: true,
++            },
++            components: {
++              default: () => import("@/views/Home.vue"),
++              v2: v2For(ROUTES.ROMSTOP_FTP),
++            },
++          },
+           {
+             path: "metadata-sources",
+             name: ROUTES.METADATA_SOURCES,
+@@ -528,6 +541,25 @@ const routes = [
            v2: v2For(ROUTES.COLLECTIONS_INDEX),
          },
        },
@@ -74,8 +157,45 @@ index 8d93bbf..d200306 100644
        {
          path: ":pathMatch(.*)*",
          name: ROUTES.NOT_FOUND,
+diff --git a/frontend/src/v2/components/AppShell/UserMenu.vue b/frontend/src/v2/components/AppShell/UserMenu.vue
+index b787709..2d937f1 100644
+--- a/frontend/src/v2/components/AppShell/UserMenu.vue
++++ b/frontend/src/v2/components/AppShell/UserMenu.vue
+@@ -251,6 +251,14 @@ async function onLogout() {
+         :label="t('settings.conversion-settings')"
+         @click="open = false"
+       />
++      <!-- RomStop: Send with FTP settings -->
++      <RMenuItem
++        v-if="isAdmin"
++        :to="{ name: ROUTES.ROMSTOP_FTP }"
++        icon="mdi-upload-network-outline"
++        :label="t('romshelf.ftp-title')"
++        @click="open = false"
++      />
+       <RMenuItem
+         v-if="isAdmin"
+         :to="{ name: ROUTES.METADATA_SOURCES }"
+diff --git a/frontend/src/v2/components/Settings/SettingsSidebar.vue b/frontend/src/v2/components/Settings/SettingsSidebar.vue
+index 5ef6c86..03ab8fc 100644
+--- a/frontend/src/v2/components/Settings/SettingsSidebar.vue
++++ b/frontend/src/v2/components/Settings/SettingsSidebar.vue
+@@ -118,6 +118,13 @@ const groups = computed<Group[]>(() => {
+             scopes.value.includes("platforms.write") &&
+             heartbeat.value.CONVERTO.ENABLED,
+         },
++        {
++          // RomStop: where "Send with FTP" sends installed hacks.
++          icon: "mdi-upload-network-outline",
++          label: t("romshelf.ftp-title"),
++          to: { name: ROUTES.ROMSTOP_FTP },
++          visible: isAdmin.value,
++        },
+         {
+           icon: "mdi-database-cog-outline",
+           label: t("scan.metadata-sources"),
 diff --git a/frontend/src/v2/composables/useNavDestinations/index.ts b/frontend/src/v2/composables/useNavDestinations/index.ts
-index 57a34bd..464b822 100644
+index 57a34bd..1529d8a 100644
 --- a/frontend/src/v2/composables/useNavDestinations/index.ts
 +++ b/frontend/src/v2/composables/useNavDestinations/index.ts
 @@ -1,5 +1,5 @@
@@ -125,20 +245,21 @@ index 57a34bd..464b822 100644
    return null;
  }
 diff --git a/frontend/src/v2/router/routes.ts b/frontend/src/v2/router/routes.ts
-index 3b21eff..bdba421 100644
+index 3b21eff..094e85c 100644
 --- a/frontend/src/v2/router/routes.ts
 +++ b/frontend/src/v2/router/routes.ts
-@@ -72,6 +72,8 @@ export const v2RouteComponents: Partial<Record<RouteName, V2Route>> = {
+@@ -72,6 +72,9 @@ export const v2RouteComponents: Partial<Record<RouteName, V2Route>> = {
    // V2-only index pages (no v1 equivalent: the v1 UI uses its drawer)
    [ROUTES.PLATFORMS_INDEX]: () => import("@/v2/views/PlatformsIndex.vue"),
    [ROUTES.COLLECTIONS_INDEX]: () => import("@/v2/views/CollectionsIndex.vue"),
 +  [ROUTES.ROMSHELF]: () => import("@/v2/views/Romshelf/RomshelfIndex.vue"),
 +  [ROUTES.ROMSHELF_HACK]: () => import("@/v2/views/Romshelf/RomshelfHack.vue"),
++  [ROUTES.ROMSTOP_FTP]: () => import("@/v2/views/Romshelf/FtpSettings.vue"),
    // V2-only dev tool: live gamepad input inspector.
    [ROUTES.CONTROLLER_DEBUG]: () => import("@/v2/views/ControllerDebug.vue"),
    // v1-only easter egg: no v2 component links here, so the URL is a dead end.
 diff --git a/frontend/src/v2/views/GameDetails.vue b/frontend/src/v2/views/GameDetails.vue
-index a486818..6718a75 100644
+index a486818..c568fc4 100644
 --- a/frontend/src/v2/views/GameDetails.vue
 +++ b/frontend/src/v2/views/GameDetails.vue
 @@ -13,6 +13,7 @@ import { onBeforeRouteUpdate, useRoute, useRouter } from "vue-router";

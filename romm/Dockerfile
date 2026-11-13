@@ -21,6 +21,8 @@ RUN npm run typecheck && npm run build
 FROM rommapp/romm:${ROMM_VERSION}
 ARG WEBSERVER_FOLDER=/var/www/html
 COPY --from=source /src/romm/backend/main.py /backend/main.py
+# Scans each file in a platform's "Hacks" folder as its own game (RomStop's Hacks folder option).
+COPY --from=source /src/romm/backend/config/config_manager.py /backend/config/config_manager.py
 COPY --from=source /src/romm/backend/endpoints/romshelf.py /backend/endpoints/romshelf.py
 COPY --from=source /src/romm/backend/handler/romshelf /backend/handler/romshelf
 # Copied over, not replacing the folder: the official image keeps emulators, platform icons and the resources link there too.
