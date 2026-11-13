@@ -354,6 +354,95 @@ async function install(input: RomshelfInstallInput) {
   return api.post<RomshelfInstallResult>("/romshelf/install", form);
 }
 
+// ---- Send with FTP. Shapes mirror the /romshelf/ftp routes.
+
+export type FtpHacksMode = "match" | "always" | "never";
+
+export interface FtpSettings {
+  enabled: boolean;
+  name: string;
+  preset: string | null;
+  host: string;
+  port: number;
+  username: string;
+  tls: boolean;
+  passive: boolean;
+  base_path: string;
+  /** RomM platform folder (fs_slug) -> folder on the device. */
+  folders: Record<string, string>;
+  hacks: FtpHacksMode;
+  hacks_folder: string;
+  existing: "replace" | "skip";
+  timeout: number;
+  /** The password is never sent back; this says whether one is saved. */
+  password_set: boolean;
+}
+
+export type FtpSettingsInput = Partial<Omit<FtpSettings, "password_set">> & {
+  /** Left out (or empty) keeps the saved password. */
+  password?: string;
+  clear_password?: boolean;
+};
+
+export interface FtpPreset {
+  id: string;
+  label: string;
+  description: string;
+  settings: Partial<FtpSettings>;
+}
+
+export interface FtpStatus {
+  enabled: boolean;
+  name: string | null;
+}
+
+export interface FtpTestResult {
+  ok: boolean;
+  welcome: string;
+  folders: string[];
+}
+
+export interface FtpJob {
+  id: string;
+  rom_id: number;
+  status: "running" | "done" | "failed";
+  total: number;
+  done: number;
+  current: string | null;
+  message: string | null;
+  code: string | null;
+  sent: number;
+  skipped: number;
+  target: string;
+  dest: string;
+}
+
+async function getFtpStatus() {
+  return api.get<FtpStatus>("/romshelf/ftp/status");
+}
+
+async function getFtpSettings() {
+  return api.get<{ settings: FtpSettings; presets: FtpPreset[]; hacks_folder: string }>(
+    "/romshelf/ftp/settings",
+  );
+}
+
+async function saveFtpSettings(input: FtpSettingsInput) {
+  return api.put<{ settings: FtpSettings }>("/romshelf/ftp/settings", input);
+}
+
+async function testFtp(input: FtpSettingsInput) {
+  return api.post<FtpTestResult>("/romshelf/ftp/test", input);
+}
+
+async function sendWithFtp(romId: number) {
+  return api.post<FtpJob>("/romshelf/ftp/send", { rom_id: romId });
+}
+
+async function getFtpJob(jobId: string) {
+  return api.get<FtpJob>(`/romshelf/ftp/jobs/${encodeURIComponent(jobId)}`);
+}
+
 // ---- Save import. Shapes mirror the /romshelf/saves routes.
 
 export interface SaveImportGame {
@@ -500,4 +589,10 @@ export default {
   getSaveImportOptions,
   planSaveImport,
   uploadSaveFile,
+  getFtpStatus,
+  getFtpSettings,
+  saveFtpSettings,
+  testFtp,
+  sendWithFtp,
+  getFtpJob,
 };
