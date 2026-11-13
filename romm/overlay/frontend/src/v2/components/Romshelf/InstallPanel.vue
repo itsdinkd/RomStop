@@ -14,6 +14,7 @@ import {
 } from "@v2/lib";
 import { computed, onBeforeUnmount, ref, watch } from "vue";
 import { useI18n } from "vue-i18n";
+import { useUserLocalStorage } from "@/composables/useUserLocalStorage";
 import { ROUTES } from "@/plugins/routeNames";
 import romshelfApi, {
   installErrorOf,
@@ -80,6 +81,8 @@ const fileId = ref<number | null>(
   props.defaultFileId ?? props.files[0]?.id ?? null,
 );
 const installAnyway = ref(false);
+// Remembered per user: installs go to <platform>/Hacks/ (the backend creates it) instead of next to the games.
+const hacksFolder = useUserLocalStorage("romstop.install.hacksFolder", false);
 const patchFile = ref<File | null>(null);
 const patchMember = ref<string | null>(null);
 const installing = ref(false);
@@ -185,6 +188,7 @@ async function submit(replace = false) {
       patchFile: patchFile.value,
       patchMember: patchMember.value,
       replace: replace || previousCode === "already_installed",
+      hacksFolder: hacksFolder.value,
     });
     if (!data.checksum_validated) {
       snackbar.warning(t("romshelf.checksum-warning"), { timeout: 6000 });
@@ -438,6 +442,15 @@ function onFiles(files: File[]) {
         @files="onFiles"
       />
     </div>
+
+    <!-- A replaced install stays in the folder it is already in. -->
+    <RCheckbox
+      v-if="!installedHere"
+      v-model="hacksFolder"
+      :label="t('romshelf.hacks-folder')"
+      :disabled="installing || !!pendingRecord"
+      hide-details
+    />
 
     <div class="r-v2-rs-install__actions">
       <RBtn

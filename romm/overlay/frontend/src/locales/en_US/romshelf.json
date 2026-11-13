@@ -39,6 +39,7 @@
   "file-to-patch": "File to patch",
   "fits-count": "{n} fit this ROM",
   "hack-of": "A hack of {game}",
+  "hacks-folder": "Save to a Hacks folder in this platform's folder",
   "hashing": "Checking {n} ROMs for headers",
   "index-date": "Index from {date}",
   "index-error": "Could not reach the RomStop index: {error}",

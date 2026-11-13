@@ -389,6 +389,7 @@ async def install_hack(
     patch_member: Annotated[str | None, Form(description="Which patch to use when the download holds several.")] = None,
     archive_member: Annotated[str | None, Form(description="File inside a ZIP ROM to patch.")] = None,
     replace: Annotated[bool, Form()] = False,
+    hacks_folder: Annotated[bool, Form(description='Save the hack in a "Hacks" folder inside the platform folder.')] = False,
     patch_file: Annotated[UploadFile | None, File(description="The patch or its archive, when the site needs a browser download.")] = None,
 ) -> dict[str, Any]:
     """Download the hack's patch, apply it to one of this ROM's files and add the result to the library as a new ROM.
@@ -424,7 +425,7 @@ async def install_hack(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail={"message": f"{rom_file.file_name} is missing from disk.", "code": "missing_file"})
 
     if method:
-        return await _install_mod(request, hack, chosen, base_rom, rom_file, patch_file, replace, m)
+        return await _install_mod(request, hack, chosen, base_rom, rom_file, patch_file, replace, m, hacks_folder)
 
     work = Path(tempfile.mkdtemp(prefix="romshelf_patch_"))
     try:
@@ -445,6 +446,7 @@ async def install_hack(
             user_id=request.user.id,
             archive_member=archive_member,
             replace=replace,
+            hacks_folder=hacks_folder,
         )
     except (PatchSourceError, romshelf_installs.InstallError) as exc:
         raise _error(exc) from exc
@@ -461,7 +463,7 @@ async def install_hack(
     return {**_install_json(record), "needed": needed_rom_label(hack, base), "match": m.level.value}
 
 
-async def _install_mod(request: Request, hack: dict[str, Any], chosen: dict[str, Any] | None, base_rom: Any, rom_file: Any, patch_file: UploadFile | None, replace: bool, m: Match) -> dict[str, Any]:
+async def _install_mod(request: Request, hack: dict[str, Any], chosen: dict[str, Any] | None, base_rom: Any, rom_file: Any, patch_file: UploadFile | None, replace: bool, m: Match, hacks_folder: bool = False) -> dict[str, Any]:
     """Wii Riivolution / Vita rePatch: fetch the mod package and lay it over the game (see handler/romshelf/modpatch.py)."""
     work = Path(tempfile.mkdtemp(prefix="romshelf_modsrc_"))
     try:
@@ -470,7 +472,7 @@ async def _install_mod(request: Request, hack: dict[str, Any], chosen: dict[str,
         else:
             package = await _fetch_first(patch_urls(hack, chosen), work)
         record = await romshelf_installs.install_mod(
-            hack=hack, version=chosen, rom_file=rom_file, base_rom=base_rom, package=package, user_id=request.user.id, replace=replace
+            hack=hack, version=chosen, rom_file=rom_file, base_rom=base_rom, package=package, user_id=request.user.id, replace=replace, hacks_folder=hacks_folder
         )
     except (PatchSourceError, romshelf_installs.InstallError) as exc:
         raise _error(exc) from exc

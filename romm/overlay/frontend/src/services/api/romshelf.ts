@@ -245,6 +245,8 @@ export interface RomshelfInstallInput {
   version?: string | null;
   patchMember?: string | null;
   replace?: boolean;
+  /** Save the hack in a "Hacks" folder inside the platform folder. */
+  hacksFolder?: boolean;
   patchFile?: File | null;
 }
 
@@ -347,6 +349,7 @@ async function install(input: RomshelfInstallInput) {
   if (input.version) form.append("version", input.version);
   if (input.patchMember) form.append("patch_member", input.patchMember);
   if (input.replace) form.append("replace", "true");
+  if (input.hacksFolder) form.append("hacks_folder", "true");
   if (input.patchFile) form.append("patch_file", input.patchFile);
   return api.post<RomshelfInstallResult>("/romshelf/install", form);
 }
