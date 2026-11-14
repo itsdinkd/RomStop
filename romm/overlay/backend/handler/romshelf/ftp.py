@@ -4,7 +4,8 @@ Meant for consoles and handhelds that run their own FTP server, such as a jailbr
 RetroArch: RomM patches the hack, then pushes the finished ROM to `<base path>/<console folder>/[Hacks/]<file>`.
 Nothing here is device-specific; presets (PRESETS) only fill in the settings form.
 
-Settings live in RomM resources `romshelf/ftp.json` (owner read/write only), set by an admin. The password is
+Settings live in RomM resources `romshelf/ftp.json` (owner read/write only), set by an admin: one or more targets
+(a PS5, a handheld...), each with its own server, folders and saves settings, and a default. Each password is
 encrypted with a key derived from ROMM_AUTH_SECRET_KEY and is never sent back to the browser. Transfers run in a
 background thread; their progress is kept in `romshelf/ftp.sqlite` so any RomM worker can report it."""
 
@@ -133,8 +134,18 @@ def _clean_folder(value: Any, field: str) -> str:
     return "/".join(p for p in text.split("/") if p)
 
 
+def new_id() -> str:
+    return uuid.uuid4().hex[:8]
+
+
+def _clean_id(value: Any) -> str:
+    text = str(value or "")
+    return text if re.fullmatch(r"[A-Za-z0-9_-]{1,32}", text) else ""
+
+
 def _validate(raw: dict[str, Any]) -> dict[str, Any]:
     s = {k: raw.get(k, v) for k, v in DEFAULTS.items()}
+    s["id"] = _clean_id(raw.get("id")) or new_id()
     s["enabled"] = bool(s["enabled"])
     s["name"] = str(s["name"] or "").strip()[:60]
     s["preset"] = s["preset"] if s["preset"] in PRESETS else None
@@ -173,55 +184,149 @@ def _validate(raw: dict[str, Any]) -> dict[str, Any]:
     return s
 
 
+# The settings file holds several targets (a PS5, a handheld...), each with its own server, folders and saves
+# settings, plus which one is the default and whether Send with FTP is on at all:
+#   {"version": 2, "enabled": bool, "default": "<id>", "targets": [{"id": ..., <DEFAULTS keys>, "password_enc": ...}]}
+# A file from before several targets (one target's keys at the top level) reads as that one target.
+# Every target dict handed to the rest of this module carries the global "enabled" and its own "id".
+
+
 def _read_raw() -> dict[str, Any]:
     try:
-        return json.loads(SETTINGS_FILE.read_text())
+        raw = json.loads(SETTINGS_FILE.read_text())
     except (OSError, ValueError):
         return {}
+    return raw if isinstance(raw, dict) else {}
 
 
-def load() -> dict[str, Any]:
-    """The saved settings, with the encrypted password under `password_enc`."""
+def load_all() -> dict[str, Any]:
+    """Every saved target (with its encrypted password under `password_enc`), the default's id, and the switch."""
     raw = _read_raw()
-    try:
-        s = _validate(raw)
-    except FtpError:
-        s = dict(DEFAULTS)
-    s["password_enc"] = raw.get("password_enc") or None
-    return s
+    if "targets" not in raw:  # the single-target file from the first release
+        raw = {"enabled": raw.get("enabled", False), "default": "", "targets": [{**raw, "id": raw.get("id") or "main"}] if raw.get("host") else []}
+    enabled = bool(raw.get("enabled"))
+    targets = []
+    seen: set[str] = set()
+    for t in raw.get("targets") or []:
+        if not isinstance(t, dict):
+            continue
+        try:
+            s = _validate({**t, "enabled": False})
+        except FtpError:
+            continue
+        if s["id"] in seen:
+            s["id"] = new_id()
+        seen.add(s["id"])
+        s["enabled"] = enabled
+        s["password_enc"] = t.get("password_enc") or None
+        targets.append(s)
+    ids = [t["id"] for t in targets]
+    default = raw.get("default") if raw.get("default") in ids else (ids[0] if ids else "")
+    return {"enabled": enabled, "default": default, "targets": targets}
 
 
-def public(s: dict[str, Any] | None = None) -> dict[str, Any]:
-    """Settings for the admin form: everything but the password, which only says whether one is saved."""
-    s = s or load()
-    out = {k: v for k, v in s.items() if k != "password_enc"}
+def load(target_id: str | None = None) -> dict[str, Any]:
+    """One target's settings (the default one when `target_id` is empty), with the global switch under `enabled`.
+    With no targets saved yet, the blank defaults."""
+    data = load_all()
+    wanted = target_id or data["default"]
+    for t in data["targets"]:
+        if t["id"] == wanted:
+            return dict(t)
+    if target_id:
+        raise FtpError("That FTP target isn't set up any more. Pick another one.", "unknown_target", 404)
+    return {**DEFAULTS, "id": "", "enabled": data["enabled"], "password_enc": None}
+
+
+def _public_target(s: dict[str, Any]) -> dict[str, Any]:
+    out = {k: v for k, v in s.items() if k not in ("password_enc", "enabled")}
     out["password_set"] = bool(s.get("password_enc"))
     return out
 
 
-def merged(update: dict[str, Any], current: dict[str, Any] | None = None) -> dict[str, Any]:
-    """`update` laid over the saved settings. `password` omitted or None keeps the saved one; `clear_password` removes it."""
-    current = current or load()
-    s = _validate({**{k: v for k, v in current.items() if k != "password_enc"}, **{k: v for k, v in update.items() if k in DEFAULTS}})
+def public(data: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Settings for the admin form: every target but no password, only whether one is saved."""
+    data = data or load_all()
+    return {"enabled": data["enabled"], "default": data["default"], "targets": [_public_target(t) for t in data["targets"]]}
+
+
+def _merge_target(update: dict[str, Any], current: dict[str, Any] | None, enabled: bool) -> dict[str, Any]:
+    base = {k: v for k, v in (current or {}).items() if k not in ("password_enc", "enabled")}
+    s = _validate({**base, **{k: v for k, v in update.items() if k in DEFAULTS or k == "id"}, "enabled": enabled})
     if update.get("clear_password"):
         s["password_enc"] = None
     elif isinstance(update.get("password"), str) and update["password"] != "":
         s["password_enc"] = _encrypt(update["password"])
     else:
-        s["password_enc"] = current.get("password_enc")
+        s["password_enc"] = (current or {}).get("password_enc")
     return s
 
 
-def save(update: dict[str, Any]) -> dict[str, Any]:
-    s = merged(update)
+def merged(update: dict[str, Any], current: dict[str, Any] | None = None) -> dict[str, Any]:
+    """One target's `update` laid over its saved settings (the target named by `update["id"]`, else the default).
+    `password` omitted or empty keeps the saved one; `clear_password` removes it. Used to test unsaved changes."""
+    if not current:
+        data = load_all()
+        current = next((t for t in data["targets"] if t["id"] == update.get("id")), None)
+        if current is None and not update.get("id"):
+            current = next((t for t in data["targets"] if t["id"] == data["default"]), None)
+        enabled = data["enabled"]
+    else:
+        enabled = bool(current.get("enabled"))
+    return _merge_target(update, current, bool(update.get("enabled", enabled)))
+
+
+def _write(data: dict[str, Any]) -> None:
+    out = {
+        "version": 2,
+        "enabled": data["enabled"],
+        "default": data["default"],
+        "targets": [{k: v for k, v in t.items() if k != "enabled"} for t in data["targets"]],
+    }
     ROMSHELF_DIR.mkdir(parents=True, exist_ok=True)
     tmp = SETTINGS_FILE.with_suffix(".json.tmp")
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     with os.fdopen(fd, "w") as f:
-        json.dump(s, f, indent=2)
+        json.dump(out, f, indent=2)
     os.chmod(tmp, 0o600)
     os.replace(tmp, SETTINGS_FILE)
-    return public(s)
+
+
+def save(update: dict[str, Any]) -> dict[str, Any]:
+    """Save the settings form: `{enabled, default, targets: [...]}`, where `targets` is the whole list (a target left
+    out is removed; one without an `id` is added) and each keeps its saved password unless it sends a new one.
+    Without `targets`, the update is for one target (`id`, else the default; a new one when none exist yet)."""
+    data = load_all()
+    enabled = bool(update.get("enabled", data["enabled"]))
+    saved = {t["id"]: t for t in data["targets"]}
+    if "targets" in update:
+        if not isinstance(update["targets"], list):
+            raise FtpError("Targets must be a list.", "bad_settings")
+        targets = []
+        for t in update["targets"]:
+            if not isinstance(t, dict):
+                raise FtpError("Each target must be an object.", "bad_settings")
+            targets.append(_merge_target(t, saved.get(_clean_id(t.get("id"))), enabled))
+    else:
+        wanted = _clean_id(update.get("id")) or data["default"]
+        targets = list(data["targets"])
+        index = next((i for i, t in enumerate(targets) if t["id"] == wanted), None)
+        target = _merge_target(update, targets[index] if index is not None else None, enabled)
+        if index is None:
+            targets.append(target)
+        else:
+            targets[index] = target
+    ids = [t["id"] for t in targets]
+    if len(set(ids)) != len(ids):
+        raise FtpError("Two targets have the same id.", "bad_settings")
+    if enabled and not targets:
+        raise FtpError("Add an FTP target to turn Send with FTP on.", "bad_settings")
+    default = update.get("default", data["default"])
+    data = {"enabled": enabled, "default": default if default in ids else (ids[0] if ids else ""), "targets": targets}
+    for t in targets:
+        t["enabled"] = enabled
+    _write(data)
+    return public(data)
 
 
 def target_name(s: dict[str, Any]) -> str:
@@ -229,10 +334,17 @@ def target_name(s: dict[str, Any]) -> str:
 
 
 def status() -> dict[str, Any]:
-    """What a user who may send needs to know: whether sending is on and what to call the target."""
-    s = load()
-    ready = bool(s["enabled"] and s["host"])
-    return {"enabled": ready, "name": target_name(s) if ready else None}
+    """What a user who may send needs to know: whether sending is on, and the targets to pick from (default first)."""
+    data = load_all()
+    ready = [t for t in data["targets"] if t["host"]] if data["enabled"] else []
+    ready.sort(key=lambda t: t["id"] != data["default"])
+    targets = [{"id": t["id"], "name": target_name(t)} for t in ready]
+    return {
+        "enabled": bool(targets),
+        "name": targets[0]["name"] if targets else None,
+        "default": targets[0]["id"] if targets else None,
+        "targets": targets,
+    }
 
 
 # ------------------------------------------------------------------ paths
@@ -460,19 +572,20 @@ def _jobs() -> sqlite3.Connection:
     con.execute(
         "CREATE TABLE IF NOT EXISTS jobs (id TEXT PRIMARY KEY, rom_id INTEGER, user_id INTEGER, status TEXT, total INTEGER, done INTEGER,"
         " current TEXT, message TEXT, code TEXT, sent INTEGER, skipped INTEGER, target TEXT, dest TEXT, started REAL, updated REAL,"
-        " source TEXT)"
+        " source TEXT, target_id TEXT)"
     )
     con.execute("CREATE TABLE IF NOT EXISTS save_paths (user_id INTEGER, path TEXT, used REAL, PRIMARY KEY (user_id, path))")
-    try:  # Added after the first release: the library file or folder being sent.
-        con.execute("ALTER TABLE jobs ADD COLUMN source TEXT")
-    except sqlite3.OperationalError:
-        pass
+    for column in ("source", "target_id"):  # added after the first release: what is sent, and to which target
+        try:
+            con.execute(f"ALTER TABLE jobs ADD COLUMN {column} TEXT")
+        except sqlite3.OperationalError:
+            pass
     return con
 
 
 _JOB_FIELDS = (
     "id", "rom_id", "user_id", "status", "total", "done", "current", "message", "code", "sent", "skipped", "target", "dest",
-    "started", "updated", "source",
+    "started", "updated", "source", "target_id",
 )
 _STALE_SECONDS = 600
 
@@ -489,10 +602,13 @@ def job(job_id: str) -> dict[str, Any] | None:
     return out
 
 
-def running_for(source: str) -> dict[str, Any] | None:
-    """A send of this library file that is under way, so a second click doesn't start another."""
+def running_for(source: str, target_id: str = "") -> dict[str, Any] | None:
+    """A send of this file to this target that is under way, so a second click doesn't start another."""
     with closing(_jobs()) as con:
-        row = con.execute("SELECT id FROM jobs WHERE source = ? AND status = 'running' ORDER BY started DESC LIMIT 1", (source,)).fetchone()
+        row = con.execute(
+            "SELECT id FROM jobs WHERE source = ? AND COALESCE(target_id, '') = ? AND status = 'running' ORDER BY started DESC LIMIT 1",
+            (source, target_id),
+        ).fetchone()
     found = job(row[0]) if row else None
     return found if found and found["status"] == "running" else None
 
@@ -539,7 +655,7 @@ def create_job(
     with closing(_jobs()) as con, con:
         con.execute(
             "INSERT INTO jobs (id, rom_id, user_id, status, total, done, current, message, code, sent, skipped, target, dest, started, updated,"
-            " source) VALUES (?, ?, ?, ?, ?, 0, NULL, ?, ?, 0, 0, ?, ?, ?, ?, ?)",
+            " source, target_id) VALUES (?, ?, ?, ?, ?, 0, NULL, ?, ?, 0, 0, ?, ?, ?, ?, ?, ?)",
             (
                 job_id,
                 rom_id,
@@ -553,6 +669,7 @@ def create_job(
                 now,
                 now,
                 source,
+                (s or {}).get("id") or "",
             ),
         )
     return job_id
@@ -591,7 +708,7 @@ def start(
 ) -> dict[str, Any]:
     """Record a job and run the transfer in a thread (RomM's web process lives on). Poll `job(id)` for progress.
     A send of the same file already under way is returned instead of starting another."""
-    running = running_for(source) if source else None
+    running = running_for(source, s.get("id") or "") if source else None
     if running:
         return running
     job_id = create_job(s, uploads, rom_id=rom_id, user_id=user_id, dest=dest, source=source)

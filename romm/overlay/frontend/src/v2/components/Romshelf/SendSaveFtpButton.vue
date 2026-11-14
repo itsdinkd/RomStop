@@ -5,7 +5,15 @@
 // remembered per user and offered again in a dropdown. The file is named the way RetroArch looks
 // for it, and a file already on the device is only replaced when the user says so; the server
 // keeps the old one as "<name>.bak-<time>". Hidden while Send with FTP is off.
-import { RAlert, RBtn, RDialog, RIcon, RSpinner, RTextField } from "@v2/lib";
+import {
+  RAlert,
+  RBtn,
+  RDialog,
+  RIcon,
+  RSelect,
+  RSpinner,
+  RTextField,
+} from "@v2/lib";
 import { computed, onBeforeUnmount, ref, watch } from "vue";
 import { useI18n } from "vue-i18n";
 import romshelfApi, {
@@ -13,7 +21,11 @@ import romshelfApi, {
   type FtpJob,
   type FtpSavePlan,
 } from "@/services/api/romshelf";
-import { formatBytes, useFtpStatus } from "@/v2/components/Romshelf/ftp";
+import {
+  formatBytes,
+  pickTarget,
+  useFtpStatus,
+} from "@/v2/components/Romshelf/ftp";
 import { useSnackbar } from "@/v2/composables/useSnackbar";
 import type { Asset, AssetType } from "@/v2/utils/assets";
 
@@ -24,6 +36,15 @@ const snackbar = useSnackbar();
 const ftp = useFtpStatus();
 
 const open = ref(false);
+// With several devices, the dialog starts on the default one and can switch.
+const targetId = ref<string | null>(null);
+const targetItems = computed(() =>
+  ftp.value.targets.map((x) => ({ value: x.id, title: x.name })),
+);
+function onTarget(value: unknown) {
+  targetId.value = typeof value === "string" ? value : null;
+  void openDialog();
+}
 const plan = ref<FtpSavePlan | null>(null);
 const loading = ref(false);
 const checking = ref(false);
@@ -87,6 +108,7 @@ function errorText(err: unknown) {
 }
 
 async function openDialog() {
+  if (!open.value) targetId.value = pickTarget(ftp.value, null)?.id ?? null;
   open.value = true;
   loading.value = true;
   loadError.value = null;
@@ -96,6 +118,7 @@ async function openDialog() {
     const { data } = await romshelfApi.planSaveWithFtp({
       type: props.type,
       id: props.asset.id,
+      target: targetId.value,
     });
     plan.value = data;
     recent.value = data.recent_paths;
@@ -132,6 +155,7 @@ async function check() {
     const { data } = await romshelfApi.planSaveWithFtp({
       type: props.type,
       id: props.asset.id,
+      target: targetId.value,
       folder,
       file_name: fileName.value.trim() || null,
     });
@@ -218,6 +242,7 @@ async function send() {
     const { data } = await romshelfApi.sendSaveWithFtp({
       type: props.type,
       id: props.asset.id,
+      target: targetId.value,
       folder: mode.value === "custom" ? customPath.value.trim() : null,
       file_name: name !== plan.value.file_name ? name : null,
       replace,
@@ -305,6 +330,19 @@ onBeforeUnmount(() => {
         <span>{{ title }}</span>
       </template>
       <template #content>
+        <RSelect
+          v-if="ftp.targets.length > 1"
+          :model-value="targetId ?? ''"
+          :items="targetItems"
+          item-title="title"
+          item-value="value"
+          :label="t('romshelf.ftp-save-device')"
+          prefix-label="stacked"
+          density="compact"
+          hide-details
+          class="r-v2-rs-save-ftp__device"
+          @update:model-value="onTarget"
+        />
         <div v-if="loading" class="r-v2-rs-save-ftp__loading">
           <RSpinner :size="20" />
         </div>
@@ -491,6 +529,9 @@ onBeforeUnmount(() => {
   display: flex;
   flex-direction: column;
   gap: var(--r-space-3);
+}
+.r-v2-rs-save-ftp__device {
+  margin-bottom: var(--r-space-3);
 }
 .r-v2-rs-save-ftp__loading {
   display: grid;

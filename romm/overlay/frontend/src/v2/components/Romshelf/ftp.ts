@@ -2,7 +2,13 @@
 import { ref } from "vue";
 import romshelfApi, { type FtpStatus } from "@/services/api/romshelf";
 
-const status = ref<FtpStatus>({ enabled: false, name: null });
+const OFF: FtpStatus = {
+  enabled: false,
+  name: null,
+  default: null,
+  targets: [],
+};
+const status = ref<FtpStatus>(OFF);
 let loading: Promise<void> | null = null;
 
 export function useFtpStatus(refresh = false) {
@@ -13,10 +19,15 @@ export function useFtpStatus(refresh = false) {
         status.value = data;
       })
       .catch(() => {
-        status.value = { enabled: false, name: null };
+        status.value = OFF;
       });
   }
   return status;
+}
+
+/** The target to use: `wanted` if it is still set up, else the default. */
+export function pickTarget(s: FtpStatus, wanted: string | null | undefined) {
+  return s.targets.find((t) => t.id === wanted) ?? s.targets[0] ?? null;
 }
 
 export function formatBytes(n: number): string {

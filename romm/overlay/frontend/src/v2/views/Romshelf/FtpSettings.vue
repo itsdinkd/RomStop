@@ -1,7 +1,8 @@
 <script setup lang="ts">
-// Settings > Send with FTP (admins only): the FTP server installed hacks are sent to with "Send with FTP",
-// say a jailbroken PS5's FTP payload next to RetroArch. Presets only fill in the form.
-// The password is saved on the RomM server (encrypted) and never comes back to the browser.
+// Settings > Send with FTP (admins only): the FTP targets installed hacks and saves are sent to, say a jailbroken
+// PS5's FTP payload next to RetroArch and a handheld. Each target has its own server, folders and saves settings;
+// one is the default. Presets only fill in the form. Passwords are saved on the RomM server (encrypted) and never
+// come back to the browser.
 import {
   RAlert,
   RBtn,
@@ -12,7 +13,7 @@ import {
   RTextField,
 } from "@v2/lib";
 import { storeToRefs } from "pinia";
-import { computed, onMounted, reactive, ref } from "vue";
+import { computed, onMounted, ref } from "vue";
 import { useI18n } from "vue-i18n";
 import { onBeforeRouteLeave } from "vue-router";
 import romshelfApi, {
@@ -20,6 +21,8 @@ import romshelfApi, {
   type FtpPreset,
   type FtpSettings,
   type FtpSettingsInput,
+  type FtpTarget,
+  type FtpTargetInput,
   type FtpTestResult,
 } from "@/services/api/romshelf";
 import storePlatforms from "@/stores/platforms";
@@ -40,16 +43,14 @@ const confirm = useConfirm();
 const isAdmin = useCan("app.admin");
 const { allPlatforms } = storeToRefs(storePlatforms());
 
-type Form = Omit<FtpSettings, "password_set">;
+// One editable target: its saved settings plus the password typed into the form (sent only when set).
+type TargetForm = Omit<FtpTarget, "password_set"> & {
+  password_set: boolean;
+  password: string;
+  clearPassword: boolean;
+};
 
-const loading = ref(true);
-const loadError = ref<string | null>(null);
-const saving = ref(false);
-const testing = ref(false);
-const presets = ref<FtpPreset[]>([]);
-const saved = ref<FtpSettings | null>(null);
-const form = reactive<Form>({
-  enabled: false,
+const BLANK: Omit<FtpTarget, "id" | "password_set"> = {
   name: "",
   preset: null,
   host: "",
@@ -66,26 +67,59 @@ const form = reactive<Form>({
   saves_path: "",
   states_path: "",
   saves_layout: "flat",
-});
-const password = ref("");
-const clearPassword = ref(false);
+};
+
+const loading = ref(true);
+const loadError = ref<string | null>(null);
+const saving = ref(false);
+const testing = ref(false);
+const presets = ref<FtpPreset[]>([]);
+const saved = ref<FtpSettings | null>(null);
+const enabled = ref(false);
+const defaultId = ref("");
+const targets = ref<TargetForm[]>([]);
+const selectedId = ref("");
 const testResult = ref<FtpTestResult | null>(null);
 const testError = ref<string | null>(null);
 const platformFilter = ref("");
 
+// The target being edited. The sections below the targets list all edit this one.
+const form = computed<TargetForm>(
+  () =>
+    targets.value.find((x) => x.id === selectedId.value) ??
+    targets.value[0] ?? {
+      ...BLANK,
+      id: "",
+      password_set: false,
+      password: "",
+      clearPassword: false,
+    },
+);
+const hasTarget = computed(() => targets.value.length > 0);
+
+function toForm(target: FtpTarget): TargetForm {
+  return {
+    ...target,
+    folders: { ...target.folders },
+    password: "",
+    clearPassword: false,
+  };
+}
+
 function fill(s: FtpSettings) {
-  const { password_set: _set, ...rest } = s;
-  Object.assign(form, { ...rest, folders: { ...rest.folders } });
-  password.value = "";
-  clearPassword.value = false;
+  enabled.value = s.enabled;
+  defaultId.value = s.default;
+  targets.value = s.targets.map(toForm);
+  if (!targets.value.some((x) => x.id === selectedId.value))
+    selectedId.value = s.default || targets.value[0]?.id || "";
 }
 
 const snapshot = ref("");
 const current = () =>
   JSON.stringify({
-    ...form,
-    password: password.value,
-    clear: clearPassword.value,
+    enabled: enabled.value,
+    default: defaultId.value,
+    targets: targets.value,
   });
 const dirty = computed(() => !!saved.value && current() !== snapshot.value);
 
@@ -109,26 +143,75 @@ onMounted(() => {
   else loading.value = false;
 });
 
+function newId() {
+  return Math.random().toString(16).slice(2, 10).padEnd(8, "0");
+}
+function targetLabel(x: TargetForm) {
+  return (
+    x.name ||
+    presets.value.find((p) => p.id === x.preset)?.label ||
+    x.host ||
+    t("romshelf.ftp-target-unnamed")
+  );
+}
+function selectTarget(id: string) {
+  selectedId.value = id;
+  testResult.value = null;
+  testError.value = null;
+}
+function addTarget() {
+  const id = newId();
+  targets.value = [
+    ...targets.value,
+    {
+      ...BLANK,
+      folders: {},
+      id,
+      name: "",
+      password_set: false,
+      password: "",
+      clearPassword: false,
+    },
+  ];
+  if (!defaultId.value) defaultId.value = id;
+  selectTarget(id);
+}
+async function removeTarget() {
+  const target = form.value;
+  const ok = await confirm({
+    title: t("romshelf.ftp-target-remove-title", { name: targetLabel(target) }),
+    body: t("romshelf.ftp-target-remove-body"),
+    confirmText: t("romshelf.ftp-target-remove"),
+    tone: "danger",
+  });
+  if (!ok) return;
+  targets.value = targets.value.filter((x) => x.id !== target.id);
+  if (defaultId.value === target.id)
+    defaultId.value = targets.value[0]?.id ?? "";
+  selectTarget(defaultId.value || targets.value[0]?.id || "");
+}
+
 const presetItems = computed(() => [
   { value: "", title: t("romshelf.ftp-preset-custom") },
   ...presets.value.map((p) => ({ value: p.id, title: p.label })),
 ]);
 const presetValue = computed({
-  get: () => form.preset ?? "",
+  get: () => form.value.preset ?? "",
   set: (id: string) => applyPreset(id),
 });
 const activePreset = computed(
-  () => presets.value.find((p) => p.id === form.preset) ?? null,
+  () => presets.value.find((p) => p.id === form.value.preset) ?? null,
 );
 
 function applyPreset(id: string) {
+  const target = form.value;
   const preset = presets.value.find((p) => p.id === id);
-  form.preset = preset ? preset.id : null;
+  target.preset = preset ? preset.id : null;
   if (!preset) return;
   // The preset fills the form; the host and anything else stay editable.
-  const { folders, ...settings } = preset.settings;
-  Object.assign(form, settings);
-  if (folders) form.folders = { ...folders };
+  const { folders, id: _id, ...settings } = preset.settings;
+  Object.assign(target, settings);
+  if (folders) target.folders = { ...folders };
 }
 
 const hacksItems = computed(() => [
@@ -150,18 +233,26 @@ const savesLayoutItems = computed(() => [
 function saveExample(base: string, file: string) {
   if (!base) return t("romshelf.ftp-saves-not-set");
   const parts = [base.replace(/\/+$/, "")];
-  if (form.saves_layout === "core" || form.saves_layout === "core_content")
-    parts.push("Snes9x");
-  if (form.saves_layout === "content" || form.saves_layout === "core_content")
-    parts.push(form.folders["snes"] || "snes");
+  const { saves_layout: layout, folders } = form.value;
+  if (layout === "core" || layout === "core_content") parts.push("Snes9x");
+  if (layout === "content" || layout === "core_content")
+    parts.push(folders["snes"] || "snes");
   return `${parts.join("/")}/${file}`;
 }
 
-function payload(): FtpSettingsInput {
-  const out: FtpSettingsInput = { ...form, folders: { ...form.folders } };
-  if (password.value) out.password = password.value;
-  if (clearPassword.value) out.clear_password = true;
+function targetPayload(x: TargetForm): FtpTargetInput {
+  const { password, clearPassword, password_set: _set, ...rest } = x;
+  const out: FtpTargetInput = { ...rest, folders: { ...x.folders } };
+  if (password) out.password = password;
+  if (clearPassword) out.clear_password = true;
   return out;
+}
+function payload(): FtpSettingsInput {
+  return {
+    enabled: enabled.value,
+    default: defaultId.value,
+    targets: targets.value.map(targetPayload),
+  };
 }
 
 async function onSave() {
@@ -190,7 +281,7 @@ async function onTest() {
   testResult.value = null;
   testError.value = null;
   try {
-    const { data } = await romshelfApi.testFtp(payload());
+    const { data } = await romshelfApi.testFtp(targetPayload(form.value));
     testResult.value = data;
   } catch (err) {
     testError.value = installErrorOf(err).message;
@@ -224,23 +315,24 @@ const noPlatformFolders = computed(
 );
 
 function folderFor(slug: string) {
-  return form.folders[slug] ?? "";
+  return form.value.folders[slug] ?? "";
 }
 function setFolder(slug: string, value: unknown) {
   const text = typeof value === "string" ? value.trim() : "";
-  const next = { ...form.folders };
+  const next = { ...form.value.folders };
   if (text) next[slug] = text;
   else delete next[slug];
-  form.folders = next;
+  form.value.folders = next;
 }
 function deviceFolder(slug: string) {
-  return (form.folders[slug] || slug).split("/")[0] ?? "";
+  return (form.value.folders[slug] || slug).split("/")[0] ?? "";
 }
 function examplePath(slug: string, hack: boolean) {
-  const base = form.base_path.replace(/\/+$/, "");
-  const folder = form.folders[slug] || slug;
-  const inHacks = form.hacks === "always" || (form.hacks === "match" && hack);
-  return `${base}/${folder}${inHacks ? `/${form.hacks_folder || "Hacks"}` : ""}/`;
+  const f = form.value;
+  const base = f.base_path.replace(/\/+$/, "");
+  const folder = f.folders[slug] || slug;
+  const inHacks = f.hacks === "always" || (f.hacks === "match" && hack);
+  return `${base}/${folder}${inHacks ? `/${f.hacks_folder || "Hacks"}` : ""}/`;
 }
 
 onBeforeRouteLeave(async () => {
@@ -278,331 +370,420 @@ useUnloadGuard(() => dirty.value);
         <p class="r-v2-rs-ftp-settings__desc">{{ t("romshelf.ftp-desc") }}</p>
       </div>
       <SettingsToggleRow
-        v-model="form.enabled"
+        v-model="enabled"
         class="r-v2-rs-ftp-settings__toggle"
         :title="t('romshelf.ftp-enabled')"
         :description="t('romshelf.ftp-enabled-desc')"
       />
       <div class="r-v2-rs-ftp-settings__block">
-        <div class="r-v2-rs-ftp-settings__grid r-v2-rs-ftp-settings__grid--2">
-          <RSelect
-            v-model="presetValue"
-            :items="presetItems"
-            item-title="title"
-            item-value="value"
-            :label="t('romshelf.ftp-preset')"
-            prefix-label="stacked"
-            hide-details
-          />
-          <RTextField
-            v-model="form.name"
-            :label="t('romshelf.ftp-name')"
-            :placeholder="activePreset?.label || form.host || 'FTP'"
-            prefix-label="stacked"
-            hide-details
-          />
-        </div>
-        <p v-if="activePreset" class="r-v2-rs-ftp-settings__note">
-          <RIcon icon="mdi-information-outline" size="14" />
-          <span>{{ activePreset.description }}</span>
-        </p>
-      </div>
-    </SettingsSection>
-
-    <SettingsSection
-      :title="t('romshelf.ftp-server')"
-      icon="mdi-server-network"
-    >
-      <div class="r-v2-rs-ftp-settings__block">
-        <div
-          class="r-v2-rs-ftp-settings__grid r-v2-rs-ftp-settings__grid--server"
-        >
-          <RTextField
-            v-model="form.host"
-            :label="t('romshelf.ftp-host')"
-            placeholder="192.168.1.50"
-            autocomplete="off"
-            prefix-label="stacked"
-            hide-details
-          />
-          <RTextField
-            :model-value="form.port"
-            type="number"
-            min="1"
-            max="65535"
-            :label="t('romshelf.ftp-port')"
-            prefix-label="stacked"
-            hide-details
-            @update:model-value="form.port = Number($event) || 21"
-          />
-          <RTextField
-            v-model="form.username"
-            :label="t('romshelf.ftp-username')"
-            :placeholder="t('romshelf.ftp-anonymous')"
-            autocomplete="off"
-            prefix-label="stacked"
-            hide-details
-          />
-          <RTextField
-            v-model="password"
-            type="password"
-            :label="t('romshelf.ftp-password')"
-            :placeholder="
-              saved?.password_set && !clearPassword
-                ? t('romshelf.ftp-password-saved')
-                : t('romshelf.ftp-password-none')
-            "
-            autocomplete="new-password"
-            prefix-label="stacked"
-            hide-details
-          />
-        </div>
-        <div v-if="saved?.password_set" class="r-v2-rs-ftp-settings__row">
+        <div class="r-v2-rs-ftp-settings__targets-head">
+          <span class="r-v2-rs-ftp-settings__label">{{
+            t("romshelf.ftp-targets")
+          }}</span>
           <RBtn
             size="small"
             variant="text"
-            prepend-icon="mdi-key-remove"
-            :disabled="clearPassword"
-            @click="
-              clearPassword = true;
-              password = '';
-            "
+            prepend-icon="mdi-plus"
+            @click="addTarget"
           >
-            {{
-              clearPassword
-                ? t("romshelf.ftp-password-will-clear")
-                : t("romshelf.ftp-password-clear")
-            }}
+            {{ t("romshelf.ftp-target-add") }}
           </RBtn>
         </div>
-      </div>
-      <SettingsToggleRow
-        v-model="form.passive"
-        class="r-v2-rs-ftp-settings__toggle"
-        :title="t('romshelf.ftp-passive')"
-        :description="t('romshelf.ftp-passive-desc')"
-      />
-      <SettingsToggleRow
-        v-model="form.tls"
-        class="r-v2-rs-ftp-settings__toggle"
-        :title="t('romshelf.ftp-tls')"
-        :description="t('romshelf.ftp-tls-desc')"
-      />
-      <div
-        class="r-v2-rs-ftp-settings__block r-v2-rs-ftp-settings__block--foot"
-      >
-        <div class="r-v2-rs-ftp-settings__row">
-          <RBtn
-            variant="outlined"
-            prepend-icon="mdi-lan-connect"
-            :loading="testing"
-            :disabled="!form.host"
-            @click="onTest"
-          >
-            {{ t("romshelf.ftp-test") }}
-          </RBtn>
-          <span v-if="testResult" class="r-v2-rs-ftp-settings__ok">
-            <RIcon icon="mdi-check-circle-outline" size="16" />
-            {{
-              t("romshelf.ftp-test-ok", {
-                path: form.base_path,
-                n: testResult.folders.length,
-              })
-            }}
-          </span>
-        </div>
-        <RAlert
-          v-if="testError"
-          type="error"
-          density="compact"
-          :text="testError"
-        />
-        <RAlert
-          v-if="noPlatformFolders"
-          type="warning"
-          density="compact"
-          :text="t('romshelf.ftp-test-no-platforms', { path: form.base_path })"
-        />
         <div
-          v-if="testResult?.folders.length"
-          class="r-v2-rs-ftp-settings__chips"
+          v-if="hasTarget"
+          class="r-v2-rs-ftp-settings__targets"
+          role="tablist"
+          :aria-label="t('romshelf.ftp-targets')"
         >
-          <RChip v-for="f in testResult.folders" :key="f" size="small">{{
-            f
-          }}</RChip>
-        </div>
-      </div>
-    </SettingsSection>
-
-    <SettingsSection
-      :title="t('romshelf.ftp-folders')"
-      icon="mdi-folder-arrow-up-outline"
-    >
-      <div class="r-v2-rs-ftp-settings__block">
-        <div class="r-v2-rs-ftp-settings__grid r-v2-rs-ftp-settings__grid--4">
-          <RTextField
-            v-model="form.base_path"
-            :label="t('romshelf.ftp-base-path')"
-            placeholder="/content"
-            prefix-label="stacked"
-            hide-details
-          />
-          <RSelect
-            v-model="form.existing"
-            :items="existingItems"
-            item-title="title"
-            item-value="value"
-            :label="t('romshelf.ftp-existing')"
-            prefix-label="stacked"
-            hide-details
-          />
-          <RSelect
-            v-model="form.hacks"
-            :items="hacksItems"
-            item-title="title"
-            item-value="value"
-            :label="t('romshelf.ftp-hacks')"
-            prefix-label="stacked"
-            hide-details
-          />
-          <RTextField
-            v-model="form.hacks_folder"
-            :label="t('romshelf.ftp-hacks-folder')"
-            placeholder="Hacks"
-            :disabled="form.hacks === 'never'"
-            prefix-label="stacked"
-            hide-details
-          />
-        </div>
-      </div>
-      <div class="r-v2-rs-ftp-settings__block">
-        <div class="r-v2-rs-ftp-settings__toolbar">
-          <p class="r-v2-rs-ftp-settings__note">
-            <RIcon icon="mdi-information-outline" size="14" />
-            <span>{{ t("romshelf.ftp-folders-desc") }}</span>
-          </p>
-          <RTextField
-            v-model="platformFilter"
-            :placeholder="t('romshelf.ftp-filter-platforms')"
-            prepend-inner-icon="mdi-magnify"
-            density="compact"
-            clearable
-            hide-details
-            class="r-v2-rs-ftp-settings__filter"
-          />
-        </div>
-        <div class="r-v2-rs-ftp-settings__table" role="table">
-          <div
-            class="r-v2-rs-ftp-settings__tr r-v2-rs-ftp-settings__tr--head"
-            role="row"
+          <button
+            v-for="x in targets"
+            :key="x.id"
+            type="button"
+            role="tab"
+            class="r-v2-rs-ftp-settings__target"
+            :class="{
+              'r-v2-rs-ftp-settings__target--on': x.id === form.id,
+            }"
+            :aria-selected="x.id === form.id"
+            @click="selectTarget(x.id)"
           >
-            <span role="columnheader">{{
-              t("romshelf.ftp-col-platform")
+            <RIcon icon="mdi-access-point-network" size="16" />
+            <span class="r-v2-rs-ftp-settings__target-name">{{
+              targetLabel(x)
             }}</span>
-            <span role="columnheader">{{ t("romshelf.ftp-col-folder") }}</span>
-            <span role="columnheader">{{ t("romshelf.ftp-col-lands") }}</span>
-            <span role="columnheader" />
-          </div>
-          <div
-            v-for="p in platformRows"
-            :key="p.fs_slug"
-            class="r-v2-rs-ftp-settings__tr"
-            role="row"
-          >
-            <span class="r-v2-rs-ftp-settings__name" role="cell">{{
-              p.display_name
-            }}</span>
-            <span role="cell">
-              <RTextField
-                :model-value="folderFor(p.fs_slug)"
-                :placeholder="p.fs_slug"
-                :aria-label="
-                  t('romshelf.ftp-folder-for', { platform: p.display_name })
-                "
-                density="compact"
-                hide-details
-                @update:model-value="setFolder(p.fs_slug, $event)"
-              />
-            </span>
-            <code
-              class="r-v2-rs-ftp-settings__path"
-              role="cell"
-              :title="examplePath(p.fs_slug, true)"
-              >{{ examplePath(p.fs_slug, true) }}</code
+            <span
+              v-if="x.id === defaultId"
+              class="r-v2-rs-ftp-settings__target-default"
+              >{{ t("romshelf.ftp-target-default") }}</span
             >
-            <span class="r-v2-rs-ftp-settings__state" role="cell">
-              <RIcon
-                v-if="testResult"
-                :icon="
-                  foundFolders.has(deviceFolder(p.fs_slug))
-                    ? 'mdi-check'
-                    : 'mdi-folder-plus-outline'
-                "
-                :color="
-                  foundFolders.has(deviceFolder(p.fs_slug))
-                    ? 'success'
-                    : undefined
-                "
-                :title="
-                  foundFolders.has(deviceFolder(p.fs_slug))
-                    ? t('romshelf.ftp-folder-found')
-                    : t('romshelf.ftp-folder-new')
-                "
-                size="16"
-              />
-            </span>
-          </div>
-          <p v-if="!platformRows.length" class="r-v2-rs-ftp-settings__empty">
-            {{ t("romshelf.ftp-no-platforms") }}
-          </p>
+          </button>
         </div>
-      </div>
-    </SettingsSection>
-
-    <SettingsSection
-      :title="t('romshelf.ftp-saves')"
-      icon="mdi-content-save-move-outline"
-    >
-      <div class="r-v2-rs-ftp-settings__block">
-        <p class="r-v2-rs-ftp-settings__desc">
-          {{ t("romshelf.ftp-saves-desc") }}
+        <p v-else class="r-v2-rs-ftp-settings__note">
+          <RIcon icon="mdi-information-outline" size="14" />
+          <span>{{ t("romshelf.ftp-targets-none") }}</span>
         </p>
       </div>
-      <div class="r-v2-rs-ftp-settings__block">
-        <div class="r-v2-rs-ftp-settings__grid r-v2-rs-ftp-settings__grid--3">
-          <RTextField
-            v-model="form.saves_path"
-            :label="t('romshelf.ftp-saves-path')"
-            placeholder="/data/homebrew/PPSA99169/saves"
-            prefix-label="stacked"
-            hide-details
-          />
-          <RTextField
-            v-model="form.states_path"
-            :label="t('romshelf.ftp-states-path')"
-            placeholder="/data/homebrew/PPSA99169/states"
-            prefix-label="stacked"
-            hide-details
-          />
-          <RSelect
-            v-model="form.saves_layout"
-            :items="savesLayoutItems"
-            item-title="title"
-            item-value="value"
-            :label="t('romshelf.ftp-saves-layout')"
-            prefix-label="stacked"
-            hide-details
-          />
-        </div>
-        <div class="r-v2-rs-ftp-settings__examples">
-          <span class="r-v2-rs-ftp-settings__examples-title">{{
-            t("romshelf.ftp-saves-example")
-          }}</span>
-          <code>{{ saveExample(form.saves_path, "Game.srm") }}</code>
-          <code>{{ saveExample(form.states_path, "Game.state1") }}</code>
-        </div>
-      </div>
     </SettingsSection>
+
+    <template v-if="hasTarget">
+      <SettingsSection
+        :title="t('romshelf.ftp-target-section', { name: targetLabel(form) })"
+        icon="mdi-access-point-network"
+      >
+        <div class="r-v2-rs-ftp-settings__block">
+          <div class="r-v2-rs-ftp-settings__grid r-v2-rs-ftp-settings__grid--2">
+            <RTextField
+              v-model="form.name"
+              :label="t('romshelf.ftp-name')"
+              :placeholder="activePreset?.label || form.host || 'FTP'"
+              prefix-label="stacked"
+              hide-details
+            />
+            <RSelect
+              v-model="presetValue"
+              :items="presetItems"
+              item-title="title"
+              item-value="value"
+              :label="t('romshelf.ftp-preset')"
+              prefix-label="stacked"
+              hide-details
+            />
+          </div>
+          <p v-if="activePreset" class="r-v2-rs-ftp-settings__note">
+            <RIcon icon="mdi-information-outline" size="14" />
+            <span>{{ activePreset.description }}</span>
+          </p>
+        </div>
+        <div
+          class="r-v2-rs-ftp-settings__block r-v2-rs-ftp-settings__block--foot"
+        >
+          <div class="r-v2-rs-ftp-settings__row">
+            <RBtn
+              v-if="form.id !== defaultId"
+              size="small"
+              variant="outlined"
+              prepend-icon="mdi-star-outline"
+              @click="defaultId = form.id"
+            >
+              {{ t("romshelf.ftp-target-make-default") }}
+            </RBtn>
+            <span v-else class="r-v2-rs-ftp-settings__ok">
+              <RIcon icon="mdi-star" size="16" />
+              {{ t("romshelf.ftp-target-is-default") }}
+            </span>
+            <span class="r-v2-rs-ftp-settings__spacer" />
+            <RBtn
+              size="small"
+              variant="text"
+              color="romm-red"
+              prepend-icon="mdi-delete-outline"
+              @click="removeTarget"
+            >
+              {{ t("romshelf.ftp-target-remove") }}
+            </RBtn>
+          </div>
+        </div>
+      </SettingsSection>
+
+      <SettingsSection
+        :title="t('romshelf.ftp-server')"
+        icon="mdi-server-network"
+      >
+        <div class="r-v2-rs-ftp-settings__block">
+          <div
+            class="r-v2-rs-ftp-settings__grid r-v2-rs-ftp-settings__grid--server"
+          >
+            <RTextField
+              v-model="form.host"
+              :label="t('romshelf.ftp-host')"
+              placeholder="192.168.1.50"
+              autocomplete="off"
+              prefix-label="stacked"
+              hide-details
+            />
+            <RTextField
+              :model-value="form.port"
+              type="number"
+              min="1"
+              max="65535"
+              :label="t('romshelf.ftp-port')"
+              prefix-label="stacked"
+              hide-details
+              @update:model-value="form.port = Number($event) || 21"
+            />
+            <RTextField
+              v-model="form.username"
+              :label="t('romshelf.ftp-username')"
+              :placeholder="t('romshelf.ftp-anonymous')"
+              autocomplete="off"
+              prefix-label="stacked"
+              hide-details
+            />
+            <RTextField
+              v-model="form.password"
+              type="password"
+              :label="t('romshelf.ftp-password')"
+              :placeholder="
+                form.password_set && !form.clearPassword
+                  ? t('romshelf.ftp-password-saved')
+                  : t('romshelf.ftp-password-none')
+              "
+              autocomplete="new-password"
+              prefix-label="stacked"
+              hide-details
+            />
+          </div>
+          <div v-if="form.password_set" class="r-v2-rs-ftp-settings__row">
+            <RBtn
+              size="small"
+              variant="text"
+              prepend-icon="mdi-key-remove"
+              :disabled="form.clearPassword"
+              @click="
+                form.clearPassword = true;
+                form.password = '';
+              "
+            >
+              {{
+                form.clearPassword
+                  ? t("romshelf.ftp-password-will-clear")
+                  : t("romshelf.ftp-password-clear")
+              }}
+            </RBtn>
+          </div>
+        </div>
+        <SettingsToggleRow
+          v-model="form.passive"
+          class="r-v2-rs-ftp-settings__toggle"
+          :title="t('romshelf.ftp-passive')"
+          :description="t('romshelf.ftp-passive-desc')"
+        />
+        <SettingsToggleRow
+          v-model="form.tls"
+          class="r-v2-rs-ftp-settings__toggle"
+          :title="t('romshelf.ftp-tls')"
+          :description="t('romshelf.ftp-tls-desc')"
+        />
+        <div
+          class="r-v2-rs-ftp-settings__block r-v2-rs-ftp-settings__block--foot"
+        >
+          <div class="r-v2-rs-ftp-settings__row">
+            <RBtn
+              variant="outlined"
+              prepend-icon="mdi-lan-connect"
+              :loading="testing"
+              :disabled="!form.host"
+              @click="onTest"
+            >
+              {{ t("romshelf.ftp-test") }}
+            </RBtn>
+            <span v-if="testResult" class="r-v2-rs-ftp-settings__ok">
+              <RIcon icon="mdi-check-circle-outline" size="16" />
+              {{
+                t("romshelf.ftp-test-ok", {
+                  path: form.base_path,
+                  n: testResult.folders.length,
+                })
+              }}
+            </span>
+          </div>
+          <RAlert
+            v-if="testError"
+            type="error"
+            density="compact"
+            :text="testError"
+          />
+          <RAlert
+            v-if="noPlatformFolders"
+            type="warning"
+            density="compact"
+            :text="
+              t('romshelf.ftp-test-no-platforms', { path: form.base_path })
+            "
+          />
+          <div
+            v-if="testResult?.folders.length"
+            class="r-v2-rs-ftp-settings__chips"
+          >
+            <RChip v-for="f in testResult.folders" :key="f" size="small">{{
+              f
+            }}</RChip>
+          </div>
+        </div>
+      </SettingsSection>
+
+      <SettingsSection
+        :title="t('romshelf.ftp-folders')"
+        icon="mdi-folder-arrow-up-outline"
+      >
+        <div class="r-v2-rs-ftp-settings__block">
+          <div class="r-v2-rs-ftp-settings__grid r-v2-rs-ftp-settings__grid--4">
+            <RTextField
+              v-model="form.base_path"
+              :label="t('romshelf.ftp-base-path')"
+              placeholder="/content"
+              prefix-label="stacked"
+              hide-details
+            />
+            <RSelect
+              v-model="form.existing"
+              :items="existingItems"
+              item-title="title"
+              item-value="value"
+              :label="t('romshelf.ftp-existing')"
+              prefix-label="stacked"
+              hide-details
+            />
+            <RSelect
+              v-model="form.hacks"
+              :items="hacksItems"
+              item-title="title"
+              item-value="value"
+              :label="t('romshelf.ftp-hacks')"
+              prefix-label="stacked"
+              hide-details
+            />
+            <RTextField
+              v-model="form.hacks_folder"
+              :label="t('romshelf.ftp-hacks-folder')"
+              placeholder="Hacks"
+              :disabled="form.hacks === 'never'"
+              prefix-label="stacked"
+              hide-details
+            />
+          </div>
+        </div>
+        <div class="r-v2-rs-ftp-settings__block">
+          <div class="r-v2-rs-ftp-settings__toolbar">
+            <p class="r-v2-rs-ftp-settings__note">
+              <RIcon icon="mdi-information-outline" size="14" />
+              <span>{{ t("romshelf.ftp-folders-desc") }}</span>
+            </p>
+            <RTextField
+              v-model="platformFilter"
+              :placeholder="t('romshelf.ftp-filter-platforms')"
+              prepend-inner-icon="mdi-magnify"
+              density="compact"
+              clearable
+              hide-details
+              class="r-v2-rs-ftp-settings__filter"
+            />
+          </div>
+          <div class="r-v2-rs-ftp-settings__table" role="table">
+            <div
+              class="r-v2-rs-ftp-settings__tr r-v2-rs-ftp-settings__tr--head"
+              role="row"
+            >
+              <span role="columnheader">{{
+                t("romshelf.ftp-col-platform")
+              }}</span>
+              <span role="columnheader">{{
+                t("romshelf.ftp-col-folder")
+              }}</span>
+              <span role="columnheader">{{ t("romshelf.ftp-col-lands") }}</span>
+              <span role="columnheader" />
+            </div>
+            <div
+              v-for="p in platformRows"
+              :key="p.fs_slug"
+              class="r-v2-rs-ftp-settings__tr"
+              role="row"
+            >
+              <span class="r-v2-rs-ftp-settings__name" role="cell">{{
+                p.display_name
+              }}</span>
+              <span role="cell">
+                <RTextField
+                  :model-value="folderFor(p.fs_slug)"
+                  :placeholder="p.fs_slug"
+                  :aria-label="
+                    t('romshelf.ftp-folder-for', { platform: p.display_name })
+                  "
+                  density="compact"
+                  hide-details
+                  @update:model-value="setFolder(p.fs_slug, $event)"
+                />
+              </span>
+              <code
+                class="r-v2-rs-ftp-settings__path"
+                role="cell"
+                :title="examplePath(p.fs_slug, true)"
+                >{{ examplePath(p.fs_slug, true) }}</code
+              >
+              <span class="r-v2-rs-ftp-settings__state" role="cell">
+                <RIcon
+                  v-if="testResult"
+                  :icon="
+                    foundFolders.has(deviceFolder(p.fs_slug))
+                      ? 'mdi-check'
+                      : 'mdi-folder-plus-outline'
+                  "
+                  :color="
+                    foundFolders.has(deviceFolder(p.fs_slug))
+                      ? 'success'
+                      : undefined
+                  "
+                  :title="
+                    foundFolders.has(deviceFolder(p.fs_slug))
+                      ? t('romshelf.ftp-folder-found')
+                      : t('romshelf.ftp-folder-new')
+                  "
+                  size="16"
+                />
+              </span>
+            </div>
+            <p v-if="!platformRows.length" class="r-v2-rs-ftp-settings__empty">
+              {{ t("romshelf.ftp-no-platforms") }}
+            </p>
+          </div>
+        </div>
+      </SettingsSection>
+
+      <SettingsSection
+        :title="t('romshelf.ftp-saves')"
+        icon="mdi-content-save-move-outline"
+      >
+        <div class="r-v2-rs-ftp-settings__block">
+          <p class="r-v2-rs-ftp-settings__desc">
+            {{ t("romshelf.ftp-saves-desc") }}
+          </p>
+        </div>
+        <div class="r-v2-rs-ftp-settings__block">
+          <div class="r-v2-rs-ftp-settings__grid r-v2-rs-ftp-settings__grid--3">
+            <RTextField
+              v-model="form.saves_path"
+              :label="t('romshelf.ftp-saves-path')"
+              placeholder="/data/homebrew/PPSA99169/saves"
+              prefix-label="stacked"
+              hide-details
+            />
+            <RTextField
+              v-model="form.states_path"
+              :label="t('romshelf.ftp-states-path')"
+              placeholder="/data/homebrew/PPSA99169/states"
+              prefix-label="stacked"
+              hide-details
+            />
+            <RSelect
+              v-model="form.saves_layout"
+              :items="savesLayoutItems"
+              item-title="title"
+              item-value="value"
+              :label="t('romshelf.ftp-saves-layout')"
+              prefix-label="stacked"
+              hide-details
+            />
+          </div>
+          <div class="r-v2-rs-ftp-settings__examples">
+            <span class="r-v2-rs-ftp-settings__examples-title">{{
+              t("romshelf.ftp-saves-example")
+            }}</span>
+            <code>{{ saveExample(form.saves_path, "Game.srm") }}</code>
+            <code>{{ saveExample(form.states_path, "Game.state1") }}</code>
+          </div>
+        </div>
+      </SettingsSection>
+    </template>
 
     <SettingsSaveBar
       :visible="dirty"
@@ -698,6 +879,65 @@ useUnloadGuard(() => dirty.value);
   color: var(--r-color-success);
   font-size: var(--r-font-size-sm);
 }
+.r-v2-rs-ftp-settings__spacer {
+  flex: 1;
+}
+.r-v2-rs-ftp-settings__label {
+  font-size: var(--r-font-size-sm);
+  font-weight: var(--r-font-weight-medium);
+  color: var(--r-color-fg);
+}
+.r-v2-rs-ftp-settings__targets-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+.r-v2-rs-ftp-settings__targets {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.r-v2-rs-ftp-settings__target {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  max-width: 100%;
+  padding: 8px 12px;
+  border: 1px solid var(--r-color-border);
+  border-radius: 8px;
+  background: transparent;
+  color: var(--r-color-fg-secondary);
+  font: inherit;
+  font-size: var(--r-font-size-sm);
+  cursor: pointer;
+  transition:
+    border-color var(--r-motion-fast) var(--r-motion-ease-out),
+    background var(--r-motion-fast) var(--r-motion-ease-out);
+}
+.r-v2-rs-ftp-settings__target:hover {
+  background: var(--r-color-surface);
+}
+.r-v2-rs-ftp-settings__target--on {
+  border-color: var(--r-color-brand-primary);
+  background: color-mix(in srgb, var(--r-color-brand-primary) 12%, transparent);
+  color: var(--r-color-fg);
+}
+.r-v2-rs-ftp-settings__target-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.r-v2-rs-ftp-settings__target-default {
+  padding: 1px 6px;
+  border-radius: 999px;
+  background: var(--r-color-surface);
+  color: var(--r-color-fg-muted);
+  font-size: 10.5px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
 .r-v2-rs-ftp-settings__chips {
   display: flex;
   flex-wrap: wrap;
@@ -723,10 +963,9 @@ useUnloadGuard(() => dirty.value);
 }
 .r-v2-rs-ftp-settings__tr {
   display: grid;
-  grid-template-columns: minmax(140px, 1.2fr) minmax(160px, 1fr) minmax(
-      0,
-      1.4fr
-    ) 24px;
+  grid-template-columns:
+    minmax(140px, 1.2fr) minmax(160px, 1fr) minmax(0, 1.4fr)
+    24px;
   align-items: center;
   gap: 16px;
   padding: 6px 12px;

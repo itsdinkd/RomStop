@@ -123,8 +123,8 @@ class SettingsTests(unittest.TestCase):
     def test_password_is_encrypted_never_returned_and_kept_when_left_out(self):
         out = self.mod.save({"enabled": True, "host": "192.168.1.50", "username": "me", "password": "hunter2"})
         self.assertNotIn("password", out)
-        self.assertNotIn("password_enc", out)
-        self.assertTrue(out["password_set"])
+        self.assertNotIn("password_enc", out["targets"][0])
+        self.assertTrue(out["targets"][0]["password_set"])
         raw = (self.tmp / "ftp.json").read_text()
         self.assertNotIn("hunter2", raw)
         self.assertEqual(stat.S_IMODE((self.tmp / "ftp.json").stat().st_mode), 0o600)
@@ -134,7 +134,7 @@ class SettingsTests(unittest.TestCase):
         self.assertEqual(s["port"], 2121)
         self.assertEqual(self.mod._decrypt(s["password_enc"]), "hunter2")
         self.mod.save({"clear_password": True})
-        self.assertFalse(self.mod.public()["password_set"])
+        self.assertFalse(self.mod.public()["targets"][0]["password_set"])
 
     def test_a_new_secret_key_asks_for_the_password_again(self):
         self.mod.save({"host": "ps5", "username": "me", "password": "pw"})
@@ -157,11 +157,51 @@ class SettingsTests(unittest.TestCase):
         self.assertFalse((self.tmp / "ftp.json").exists())
 
     def test_status_names_the_target_only_when_on(self):
-        self.assertEqual(self.mod.status(), {"enabled": False, "name": None})
+        self.assertEqual(self.mod.status(), {"enabled": False, "name": None, "default": None, "targets": []})
         self.mod.save({"enabled": True, "host": "10.0.0.5", "preset": "ps5-retroarch"})
-        self.assertEqual(self.mod.status(), {"enabled": True, "name": "PS5 (RetroArch)"})
+        st = self.mod.status()
+        self.assertEqual((st["enabled"], st["name"], len(st["targets"])), (True, "PS5 (RetroArch)", 1))
         self.mod.save({"name": "Living room PS5"})
         self.assertEqual(self.mod.status()["name"], "Living room PS5")
+
+    def test_several_targets_each_with_their_own_settings_and_password(self):
+        self.mod.save({"enabled": True, "host": "ps5", "name": "PS5", "password": "one"})
+        first = self.mod.load()["id"]
+        out = self.mod.save(
+            {
+                "enabled": True,
+                "default": first,
+                "targets": [
+                    {"id": first, "host": "ps5", "name": "PS5", "port": 2121},
+                    {"host": "deck.local", "name": "Steam Deck", "base_path": "/roms", "password": "two"},
+                ],
+            }
+        )
+        deck = out["targets"][1]["id"]
+        self.assertTrue(deck and deck != first)
+        self.assertEqual([t["password_set"] for t in out["targets"]], [True, True])  # the PS5 kept its password
+        self.assertEqual(self.mod._decrypt(self.mod.load(first)["password_enc"]), "one")
+        self.assertEqual(self.mod.load(deck)["base_path"], "/roms")
+        self.assertEqual(self.mod.load()["id"], first)  # the default
+        st = self.mod.status()
+        self.assertEqual([t["name"] for t in st["targets"]], ["PS5", "Steam Deck"])
+        # The default comes first; a target left out of the list is removed.
+        self.mod.save({"default": deck, "targets": [{"id": deck, "host": "deck.local", "name": "Steam Deck"}]})
+        self.assertEqual([t["name"] for t in self.mod.status()["targets"]], ["Steam Deck"])
+        with self.assertRaises(self.mod.FtpError) as ctx:
+            self.mod.load(first)
+        self.assertEqual(ctx.exception.code, "unknown_target")
+        # A test of unsaved changes is laid over the named target.
+        self.assertEqual(self.mod.merged({"id": deck, "port": 990})["host"], "deck.local")
+
+    def test_settings_from_the_first_release_become_one_target(self):
+        (self.tmp / "ftp.json").write_text('{"enabled": true, "host": "ps5", "port": 2121, "name": "PS5"}')
+        data = self.mod.load_all()
+        self.assertEqual((data["enabled"], len(data["targets"]), data["default"]), (True, 1, "main"))
+        self.assertEqual(self.mod.load()["port"], 2121)
+        self.mod.save({"port": 1337})
+        self.assertIn('"targets"', (self.tmp / "ftp.json").read_text())
+        self.assertEqual(self.mod.load("main")["port"], 1337)
 
     def test_presets_only_hold_valid_settings(self):
         for p in self.mod.iter_presets():
@@ -359,6 +399,26 @@ class SendTests(unittest.TestCase):
         job = self.mod.send_rom(rom, 1)
         self.assertEqual((job["status"], job["rom_id"]), ("done", 5))
         self.assertIn("/content/SNES/Hacks/Hack [RomStop].sfc", self.server.files)
+
+    def test_a_send_goes_to_the_target_picked_and_each_target_has_its_own_send(self):
+        out = self.ftp.save(
+            {
+                "enabled": True,
+                "targets": [
+                    {"host": "ps5", "name": "PS5", "base_path": "/content"},
+                    {"host": "deck", "name": "Deck", "base_path": "/roms", "folders": {"snes": "SNES"}},
+                ],
+            }
+        )
+        deck = out["targets"][1]["id"]
+        self.server.dirs.add("/roms")
+        job = self.mod.send_install(self.record, 1, deck)
+        self.assertEqual((job["status"], job["target"], job["target_id"], job["dest"]), ("done", "Deck", deck, "/roms/SNES/Hacks"))
+        job = self.mod.send_install(self.record, 1)  # the default target
+        self.assertEqual((job["target"], job["dest"]), ("PS5", "/content/snes/Hacks"))
+        with self.assertRaises(self.ftp.FtpError) as ctx:
+            self.mod.send_install(self.record, 1, "gone")
+        self.assertEqual(ctx.exception.status, 404)
 
     def test_an_install_still_succeeds_when_the_send_cannot_start(self):
         job = self.ftp.job(self.mod.send_install_or_record_failure(self.record, 1))  # Send with FTP is off

@@ -251,6 +251,8 @@ export interface RomshelfInstallInput {
   hacksFolder?: boolean;
   /** Send with FTP as soon as the patched file is written; independent of RomM's scan. */
   sendFtp?: boolean;
+  /** Which FTP target to send to after installing; left out uses the default one. */
+  ftpTarget?: string | null;
   patchFile?: File | null;
 }
 
@@ -355,6 +357,8 @@ async function install(input: RomshelfInstallInput) {
   if (input.replace) form.append("replace", "true");
   if (input.hacksFolder) form.append("hacks_folder", "true");
   if (input.sendFtp) form.append("send_ftp", "true");
+  if (input.sendFtp && input.ftpTarget)
+    form.append("ftp_target", input.ftpTarget);
   if (input.patchFile) form.append("patch_file", input.patchFile);
   return api.post<RomshelfInstallResult>("/romshelf/install", form);
 }
@@ -365,8 +369,9 @@ export type FtpHacksMode = "match" | "always" | "never";
 
 export type FtpSavesLayout = "flat" | "core" | "content" | "core_content";
 
-export interface FtpSettings {
-  enabled: boolean;
+/** One device Send with FTP can send to (a PS5, a handheld...), with its own server, folders and saves settings. */
+export interface FtpTarget {
+  id: string;
   name: string;
   preset: string | null;
   host: string;
@@ -390,22 +395,39 @@ export interface FtpSettings {
   password_set: boolean;
 }
 
-export type FtpSettingsInput = Partial<Omit<FtpSettings, "password_set">> & {
+export interface FtpSettings {
+  enabled: boolean;
+  /** The target sends go to unless the user picks another. */
+  default: string;
+  targets: FtpTarget[];
+}
+
+export type FtpTargetInput = Partial<Omit<FtpTarget, "password_set">> & {
   /** Left out (or empty) keeps the saved password. */
   password?: string;
   clear_password?: boolean;
 };
 
+/** The whole list: a saved target left out is removed. */
+export interface FtpSettingsInput {
+  enabled: boolean;
+  default: string;
+  targets: FtpTargetInput[];
+}
+
 export interface FtpPreset {
   id: string;
   label: string;
   description: string;
-  settings: Partial<FtpSettings>;
+  settings: Partial<FtpTarget>;
 }
 
 export interface FtpStatus {
   enabled: boolean;
+  /** The default target's name and id; `targets` lists every ready target, the default first. */
   name: string | null;
+  default: string | null;
+  targets: { id: string; name: string }[];
 }
 
 export interface FtpTestResult {
@@ -426,6 +448,7 @@ export interface FtpJob {
   sent: number;
   skipped: number;
   target: string;
+  target_id: string | null;
   dest: string;
 }
 
@@ -443,18 +466,21 @@ async function saveFtpSettings(input: FtpSettingsInput) {
   return api.put<{ settings: FtpSettings }>("/romshelf/ftp/settings", input);
 }
 
-async function testFtp(input: FtpSettingsInput) {
+async function testFtp(input: FtpTargetInput) {
   return api.post<FtpTestResult>("/romshelf/ftp/test", input);
 }
 
 /** Send an install (also before RomM's scan has added it) or a library game. */
-async function sendWithFtp(target: {
+async function sendWithFtp(input: {
   installId?: string | null;
   romId?: number | null;
+  /** The FTP target's id; left out sends to the default one. */
+  target?: string | null;
 }) {
   return api.post<FtpJob>("/romshelf/ftp/send", {
-    install_id: target.installId ?? undefined,
-    rom_id: target.romId ?? undefined,
+    install_id: input.installId ?? undefined,
+    rom_id: input.romId ?? undefined,
+    target: input.target ?? undefined,
   });
 }
 
@@ -464,6 +490,7 @@ export type FtpSaveKind = "save" | "state";
 export interface FtpSavePlan {
   kind: FtpSaveKind;
   target: string;
+  target_id: string;
   console: string;
   game: string;
   emulator: string | null;
@@ -486,6 +513,8 @@ export interface FtpSaveRequest {
   /** A folder typed in by hand; left out uses the settings' folder. */
   folder?: string | null;
   file_name?: string | null;
+  /** The FTP target's id; left out uses the default one. */
+  target?: string | null;
 }
 
 async function planSaveWithFtp(input: FtpSaveRequest) {
