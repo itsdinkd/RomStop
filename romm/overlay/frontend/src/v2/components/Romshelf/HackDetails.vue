@@ -317,6 +317,21 @@ const ratingText = computed(() => {
           </template>
         </dd>
       </div>
+      <div v-if="hack.achievements">
+        <dt>{{ t("romshelf.achievements") }}</dt>
+        <dd>
+          <a :href="hack.achievements.url" target="_blank" rel="noopener noreferrer">
+            {{
+              hack.achievements.count
+                ? t("romshelf.achievements-value", {
+                    n: hack.achievements.count,
+                    points: (hack.achievements.points ?? 0).toLocaleString(),
+                  })
+                : t("romshelf.achievements-linked")
+            }}
+          </a>
+        </dd>
+      </div>
       <div v-if="hack.language">
         <dt>{{ t("romshelf.language") }}</dt>
         <dd>{{ hack.language }}</dd>

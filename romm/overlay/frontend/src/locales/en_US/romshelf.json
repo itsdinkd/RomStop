@@ -215,6 +215,12 @@
   "unsave-hack": "Remove from saved",
   "save-failed": "Couldn't update your saved hacks. Try again.",
   "show-saved": "Saved ({n})",
+  "show-achievements": "Achievements ({n})",
+  "show-achievements-hint": "Only hacks with an achievement set on RetroAchievements",
+  "achievements": "RetroAchievements",
+  "achievements-count": "{n} achievements on RetroAchievements",
+  "achievements-value": "{n} achievements, {points} points",
+  "achievements-linked": "Achievement set (see RetroAchievements)",
   "no-saved": "No saved hacks yet",
   "no-saved-hint": "Use the bookmark on a hack to save it, say for a game you still need to add. Saved hacks are kept in RomM for your account."
 }

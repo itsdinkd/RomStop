@@ -66,6 +66,7 @@ _SUMMARY_FIELDS = (
     "tags",
     "pageUrl",
     "downloads",
+    "achievements",
 )
 
 

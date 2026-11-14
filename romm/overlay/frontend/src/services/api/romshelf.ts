@@ -55,6 +55,17 @@ export interface RomshelfPlayPick<T = string> {
   pinned: boolean;
 }
 
+/** A RetroAchievements set the hack can be played with (index field `achievements`). */
+export interface RomshelfAchievements {
+  /** RetroAchievements game id. */
+  id: number;
+  /** Unknown for a set only linked from the hack's page. */
+  count?: number;
+  points?: number;
+  url: string;
+  via: "title" | "link" | "translation";
+}
+
 export interface RomshelfHack {
   id: string;
   title: string;
@@ -96,6 +107,7 @@ export interface RomshelfHack {
   installUrl?: string | null;
   /** Mario Hack Specifics: SMW Central's Difficulty, Length and Type (only hacks from SMW Central). */
   mario?: { difficulty?: string; length?: string; types?: string[] };
+  achievements?: RomshelfAchievements;
   play?: { emulatorjs?: RomshelfPlayPick; esde?: RomshelfPlayPick; batocera?: RomshelfPlayPick<{ emulator: string; core: string }> };
 }
 
@@ -206,6 +218,7 @@ export interface RomshelfHackSummary {
   tags?: string[];
   pageUrl?: string;
   downloads?: number;
+  achievements?: RomshelfAchievements;
   cover: string | null;
   versionCount: number;
   downloadable: boolean;
