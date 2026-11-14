@@ -194,6 +194,15 @@ const platformRows = computed(() => {
     .sort((a, b) => a.display_name.localeCompare(b.display_name));
 });
 const foundFolders = computed(() => new Set(testResult.value?.folders ?? []));
+// A wrong base path is easy to miss: the first send just creates new folders next to the real ones.
+const noPlatformFolders = computed(
+  () =>
+    !!testResult.value &&
+    allPlatforms.value.length > 0 &&
+    !allPlatforms.value.some(
+      (p) => p.fs_slug && foundFolders.value.has(deviceFolder(p.fs_slug)),
+    ),
+);
 
 function folderFor(slug: string) {
   return form.folders[slug] ?? "";
@@ -374,6 +383,12 @@ useUnloadGuard(() => dirty.value);
         type="error"
         density="compact"
         :text="testError"
+      />
+      <RAlert
+        v-if="noPlatformFolders"
+        type="warning"
+        density="compact"
+        :text="t('romshelf.ftp-test-no-platforms', { path: form.base_path })"
       />
       <div
         v-if="testResult?.folders.length"

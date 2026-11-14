@@ -120,6 +120,8 @@ export interface RomshelfInstall {
   base_rom_id: number;
   installed_at: string;
   checksum_validated: boolean;
+  /** The Send with FTP job started when the install reached the library (ask for it with sendFtp). */
+  ftp_job?: string | null;
 }
 
 export interface RomshelfLibraryFile {
@@ -247,6 +249,8 @@ export interface RomshelfInstallInput {
   replace?: boolean;
   /** Save the hack in a "Hacks" folder inside the platform folder. */
   hacksFolder?: boolean;
+  /** Send with FTP once the install is in the library; RomM's server does it, so the page can be closed. */
+  sendFtp?: boolean;
   patchFile?: File | null;
 }
 
@@ -350,6 +354,7 @@ async function install(input: RomshelfInstallInput) {
   if (input.patchMember) form.append("patch_member", input.patchMember);
   if (input.replace) form.append("replace", "true");
   if (input.hacksFolder) form.append("hacks_folder", "true");
+  if (input.sendFtp) form.append("send_ftp", "true");
   if (input.patchFile) form.append("patch_file", input.patchFile);
   return api.post<RomshelfInstallResult>("/romshelf/install", form);
 }
@@ -405,7 +410,7 @@ export interface FtpTestResult {
 export interface FtpJob {
   id: string;
   rom_id: number;
-  status: "running" | "done" | "failed";
+  status: "queued" | "running" | "done" | "failed";
   total: number;
   done: number;
   current: string | null;

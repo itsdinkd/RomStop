@@ -197,6 +197,7 @@ async function submit(replace = false) {
       patchMember: patchMember.value,
       replace: replace || previousCode === "already_installed",
       hacksFolder: hacksFolder.value,
+      sendFtp: sendAfterInstall.value && ftp.value.enabled,
     });
     if (!data.checksum_validated) {
       snackbar.warning(t("romshelf.checksum-warning"), { timeout: 6000 });
@@ -224,9 +225,10 @@ async function checkInstall(attempt: number) {
       pendingRecord.value = null;
       patchFile.value = null;
       justInstalledRomId.value = data.rom_id;
-      if (sendAfterInstall.value && ftp.value.enabled) {
+      // RomM's server starts the send when the install reaches the library; show its progress here.
+      if (data.ftp_job) {
         await nextTick();
-        void ftpButton.value?.send();
+        ftpButton.value?.track(data.ftp_job);
       }
       snackbar.success(
         t("romshelf.installed-toast", { title: props.hack.title }),
@@ -248,7 +250,12 @@ async function checkInstall(attempt: number) {
   }
   emit("installed", record);
   pendingRecord.value = null;
-  snackbar.info(t("romshelf.install-waiting-scan"), { timeout: 8000 });
+  snackbar.info(
+    sendAfterInstall.value && ftp.value.enabled
+      ? t("romshelf.install-waiting-scan-ftp", { target: ftp.value.name })
+      : t("romshelf.install-waiting-scan"),
+    { timeout: 8000 },
+  );
 }
 
 // Installs made before RomStop knew about emulators get their core too.
@@ -512,6 +519,7 @@ function onFiles(files: File[]) {
         v-if="ftpRomId && !pendingRecord"
         ref="ftpButton"
         :rom-id="ftpRomId"
+        :job-id="installedHere?.ftp_job ?? null"
         :title="hack.title"
       />
       <span v-if="pendingRecord" class="r-v2-rs-install__pending">

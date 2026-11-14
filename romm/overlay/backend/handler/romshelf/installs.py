@@ -28,7 +28,7 @@ from utils.rom_patcher import apply_patch
 
 from .archives import ArchiveError, extract_rom, is_archive
 from .index import ROMSHELF_DIR
-from . import modpatch
+from . import ftp_send, modpatch
 from .matching import PLATFORM_CONSOLE, header_size
 
 INSTALLS_FILE = ROMSHELF_DIR / "installs.json"
@@ -128,6 +128,7 @@ async def install(
     archive_member: str | None,
     replace: bool,
     hacks_folder: bool = False,
+    send_ftp: bool = False,
 ) -> dict[str, Any]:
     """Patch `rom_file` with `patch_path` and drop the result where the next scan finds it as a new ROM."""
     platform = base_rom.platform
@@ -167,7 +168,7 @@ async def install(
         shutil.rmtree(work, ignore_errors=True)
     log.info(f"RomStop: installed {hack['id']} {version_label or ''} as {dest}")
 
-    return _add_record(hack, version, version_label, base_rom, rom_file, dest_dir, fs_name, user_id, validated)
+    return _add_record(hack, version, version_label, base_rom, rom_file, dest_dir, fs_name, user_id, validated, send_ftp)
 
 
 def _add_record(
@@ -180,6 +181,7 @@ def _add_record(
     fs_name: str,
     user_id: int,
     validated: bool,
+    send_ftp: bool = False,
 ) -> dict[str, Any]:
     platform = base_rom.platform
     record = {
@@ -197,6 +199,9 @@ def _add_record(
         "checksum_validated": validated,
         "status": "pending",
         "rom_id": None,
+        # Send with FTP once the scan has made it a library game (ftp_send.queue); ftp_job is that send.
+        "send_ftp": send_ftp,
+        "ftp_job": None,
         # What finalize writes onto the new ROM; kept here so the worker needs no index.
         "metadata": _metadata_for(hack, version, base_rom),
     }
@@ -216,6 +221,7 @@ async def install_mod(
     user_id: int,
     replace: bool,
     hacks_folder: bool = False,
+    send_ftp: bool = False,
 ) -> dict[str, Any]:
     """Install a Wii Riivolution or Vita rePatch mod onto `rom_file` as a new library entry.
 
@@ -260,7 +266,7 @@ async def install_mod(
     finally:
         shutil.rmtree(work, ignore_errors=True)
     log.info(f"RomStop: installed mod {hack['id']} {version_label or ''} as {dest}")
-    return _add_record(hack, version, version_label, base_rom, rom_file, dest_dir, fs_name, user_id, True)
+    return _add_record(hack, version, version_label, base_rom, rom_file, dest_dir, fs_name, user_id, True, send_ftp)
 
 
 def _metadata_for(hack: dict[str, Any], version: dict[str, Any] | None, base_rom: Rom) -> dict[str, Any]:
@@ -362,12 +368,28 @@ async def finalize(record_id: str) -> dict[str, Any] | None:
     except Exception as exc:
         log.warning(f"RomStop: could not add {rom.id} to the {COLLECTION_NAME} collection: {exc}")
 
+    send = False
     with _locked() as records:
         for r in records:
             if r["id"] == record_id:
+                # API and worker can finalize the same install at once; only the one that claims it sends.
+                if r.get("send_ftp") and not r.get("ftp_job"):
+                    r["ftp_job"] = "starting"
+                    send = True
                 r.update({"status": "done", "rom_id": rom.id, "finalized_at": datetime.now(timezone.utc).isoformat()})
                 record = r
     log.info(f"RomStop: {record['fs_name']} is ROM {rom.id}")
+    if send:
+        try:
+            job_id = await asyncio.to_thread(ftp_send.queue, rom.id, record["user_id"])
+        except Exception as exc:  # Sending is extra; the install itself is done.
+            log.warning(f"RomStop: could not start sending {record['fs_name']} with FTP: {exc}")
+            job_id = None
+        with _locked() as records:
+            for r in records:
+                if r["id"] == record_id:
+                    r["ftp_job"] = job_id or "failed"
+                    record = r
     return record
 
 

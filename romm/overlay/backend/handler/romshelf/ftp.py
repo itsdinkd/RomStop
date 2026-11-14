@@ -61,8 +61,9 @@ PRESETS: dict[str, dict[str, Any]] = {
         "label": "PS5 (RetroArch)",
         "description": (
             "A jailbroken PS5 running an FTP server payload, with RetroArch reading games from its content folder, "
-            "one folder per console (content/snes, content/nes...). The etaHEN FTP server listens on port 1337; "
-            "the standalone ftpsrv payload uses 2121. Check the content path with any FTP client first."
+            "one folder per console (content/snes, content/nes...). The base path is RetroArch's content folder, "
+            "/data/homebrew/<RetroArch's title id>/content (PPSA99169 on one tested install). The etaHEN FTP server "
+            "listens on port 1337; the standalone ftpsrv payload uses 2121. Test connection lists the folders it finds."
         ),
         "settings": {
             "name": "PS5",
@@ -70,7 +71,7 @@ PRESETS: dict[str, dict[str, Any]] = {
             "username": "",
             "tls": False,
             "passive": True,
-            "base_path": "/content",
+            "base_path": "/data/homebrew/PPSA99169/content",
             "folders": {},
             "hacks": "match",
             "hacks_folder": "Hacks",
@@ -388,6 +389,8 @@ def _jobs() -> sqlite3.Connection:
 
 _JOB_FIELDS = ("id", "rom_id", "user_id", "status", "total", "done", "current", "message", "code", "sent", "skipped", "target", "dest", "started", "updated")
 _STALE_SECONDS = 600
+# A send queued after an install waits behind RomM's other background jobs (scans) on the worker.
+_QUEUED_SECONDS = 2 * 3600
 
 
 def job(job_id: str) -> dict[str, Any] | None:
@@ -397,22 +400,85 @@ def job(job_id: str) -> dict[str, Any] | None:
         return None
     out = dict(zip(_JOB_FIELDS, row))
     # A job whose worker died (RomM restarted mid-transfer) would otherwise read as running forever.
-    if out["status"] == "running" and time.time() - (out["updated"] or 0) > _STALE_SECONDS:
+    idle = time.time() - (out["updated"] or 0)
+    if (out["status"] == "running" and idle > _STALE_SECONDS) or (out["status"] == "queued" and idle > _QUEUED_SECONDS):
         out["status"], out["code"], out["message"] = "failed", "stalled", "The transfer stopped answering. Try sending again."
     return out
 
 
 def running_for(rom_id: int) -> dict[str, Any] | None:
+    """A send of this game that is queued or under way, so a second click doesn't start another."""
     with closing(_jobs()) as con:
-        row = con.execute("SELECT id FROM jobs WHERE rom_id = ? AND status = 'running' ORDER BY started DESC LIMIT 1", (rom_id,)).fetchone()
+        row = con.execute(
+            "SELECT id FROM jobs WHERE rom_id = ? AND status IN ('running', 'queued') ORDER BY started DESC LIMIT 1", (rom_id,)
+        ).fetchone()
     found = job(row[0]) if row else None
-    return found if found and found["status"] == "running" else None
+    return found if found and found["status"] in ("running", "queued") else None
 
 
 def _update(job_id: str, **fields: Any) -> None:
     fields["updated"] = time.time()
     with closing(_jobs()) as con, con:
         con.execute(f"UPDATE jobs SET {', '.join(f'{k} = ?' for k in fields)} WHERE id = ?", (*fields.values(), job_id))
+
+
+def mark_failed(job_id: str, exc: FtpError) -> None:
+    _update(job_id, status="failed", message=str(exc), code=exc.code)
+
+
+def create_job(
+    s: dict[str, Any] | None,
+    uploads: list[Upload],
+    *,
+    rom_id: int,
+    user_id: int,
+    dest: str,
+    status: str = "running",
+    error: FtpError | None = None,
+) -> str:
+    """Record a send. `queued` waits for RomM's worker; `failed` (with `error`) reports a send that couldn't start."""
+    job_id = uuid.uuid4().hex
+    now = time.time()
+    with closing(_jobs()) as con, con:
+        con.execute(
+            "INSERT INTO jobs (id, rom_id, user_id, status, total, done, current, message, code, sent, skipped, target, dest, started, updated)"
+            " VALUES (?, ?, ?, ?, ?, 0, NULL, ?, ?, 0, 0, ?, ?, ?, ?)",
+            (
+                job_id,
+                rom_id,
+                user_id,
+                status,
+                sum(u.size for u in uploads),
+                str(error) if error else None,
+                error.code if error else None,
+                target_name(s) if s else "FTP",
+                dest,
+                now,
+                now,
+            ),
+        )
+    return job_id
+
+
+def run_job(job_id: str, s: dict[str, Any], uploads: list[Upload], factory: Callable[..., ftplib.FTP] | None = None) -> dict[str, Any]:
+    """Do the transfer for a recorded job, keeping its progress up to date. Never raises."""
+    total = sum(u.size for u in uploads)
+    _update(job_id, status="running", total=total)
+    last = [0.0]
+
+    def progress(done: int, current: str) -> None:
+        if time.monotonic() - last[0] >= 0.5:
+            last[0] = time.monotonic()
+            _update(job_id, done=done, current=current)
+
+    try:
+        result = send(s, uploads, progress, factory)
+        _update(job_id, status="done", done=total, sent=result["sent"], skipped=result["skipped"], current=None)
+    except FtpError as exc:
+        _update(job_id, status="failed", message=str(exc), code=exc.code)
+    except Exception as exc:  # Anything else still has to end the job, or the page waits forever.
+        _update(job_id, status="failed", message=f"Sending failed: {exc}", code="error")
+    return job(job_id) or {}
 
 
 def start(
@@ -426,37 +492,11 @@ def start(
     background: bool = True,
 ) -> dict[str, Any]:
     """Record a job and run the transfer in a thread. Poll `job(id)` for progress."""
-    job_id = uuid.uuid4().hex
-    now = time.time()
-    total = sum(u.size for u in uploads)
-    with closing(_jobs()) as con, con:
-        con.execute(
-            "INSERT INTO jobs (id, rom_id, user_id, status, total, done, current, message, code, sent, skipped, target, dest, started, updated)"
-            " VALUES (?, ?, ?, 'running', ?, 0, NULL, NULL, NULL, 0, 0, ?, ?, ?, ?)",
-            (job_id, rom_id, user_id, total, target_name(s), dest, now, now),
-        )
-
-    last = [0.0]
-
-    def progress(done: int, current: str) -> None:
-        if time.monotonic() - last[0] >= 0.5:
-            last[0] = time.monotonic()
-            _update(job_id, done=done, current=current)
-
-    def run() -> None:
-        try:
-            result = send(s, uploads, progress, factory)
-            _update(job_id, status="done", done=total, sent=result["sent"], skipped=result["skipped"], current=None)
-        except FtpError as exc:
-            _update(job_id, status="failed", message=str(exc), code=exc.code)
-        except Exception as exc:  # Anything else still has to end the job, or the page waits forever.
-            _update(job_id, status="failed", message=f"Sending failed: {exc}", code="error")
-
+    job_id = create_job(s, uploads, rom_id=rom_id, user_id=user_id, dest=dest)
     if background:
-        threading.Thread(target=run, name=f"romstop-ftp-{job_id[:8]}", daemon=True).start()
-    else:
-        run()
-    return job(job_id) or {}
+        threading.Thread(target=run_job, args=(job_id, s, uploads, factory), name=f"romstop-ftp-{job_id[:8]}", daemon=True).start()
+        return job(job_id) or {}
+    return run_job(job_id, s, uploads, factory)
 
 
 def iter_presets() -> Iterator[dict[str, Any]]:
