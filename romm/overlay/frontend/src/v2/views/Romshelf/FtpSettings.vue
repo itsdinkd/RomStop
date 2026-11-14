@@ -539,7 +539,8 @@ useUnloadGuard(() => dirty.value);
 }
 .r-v2-rs-ftp-settings__platform {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) minmax(120px, 220px) 20px;
+  grid-template-columns: minmax(0, 280px) minmax(120px, 240px) 20px;
+  justify-content: start;
   align-items: center;
   gap: var(--r-space-3);
 }

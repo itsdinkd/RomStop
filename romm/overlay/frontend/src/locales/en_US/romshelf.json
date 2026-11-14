@@ -90,6 +90,7 @@
   "ftp-tls": "FTPS (explicit TLS)",
   "ftp-tls-desc": "Only for servers that support it; console FTP payloads usually don't.",
   "ftp-unsaved": "Unsaved FTP settings",
+  "ftp-username": "Username",
   "hack-of": "A hack of {game}",
   "hacks-folder": "Save to a Hacks folder in this platform's folder",
   "hashing": "Checking {n} ROMs for headers",
