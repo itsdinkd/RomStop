@@ -16,11 +16,17 @@ from logger.logger import log
 from . import ftp
 
 
-def _send(fs_path: str, fs_name: str, platform_fs_slug: str, *, rom_id: int | None, user_id: int) -> dict[str, Any]:
-    """Start sending `<library>/<fs_path>/<fs_name>` (a file, or a folder game) in the background."""
-    settings = ftp.load()
-    if not settings["enabled"] or not settings["host"]:
+def _target(target_id: str | None) -> dict[str, Any]:
+    """The FTP target to send to (the default one when none is named), if Send with FTP is on."""
+    s = ftp.load(target_id)
+    if not s["enabled"] or not s["host"]:
         raise ftp.FtpError("Send with FTP is off. An admin can turn it on under Settings > Send with FTP.", "not_configured")
+    return s
+
+
+def _send(fs_path: str, fs_name: str, platform_fs_slug: str, *, rom_id: int | None, user_id: int, target_id: str | None = None) -> dict[str, Any]:
+    """Start sending `<library>/<fs_path>/<fs_name>` (a file, or a folder game) in the background."""
+    settings = _target(target_id)
     try:
         local = fs_rom_handler.validate_path(f"{fs_path}/{fs_name}")
     except ValueError as exc:
@@ -32,21 +38,21 @@ def _send(fs_path: str, fs_name: str, platform_fs_slug: str, *, rom_id: int | No
     return ftp.start(settings, uploads, rom_id=rom_id, user_id=user_id, dest=dest, source=str(local))
 
 
-def send_rom(rom: Any, user_id: int) -> dict[str, Any]:
+def send_rom(rom: Any, user_id: int, target_id: str | None = None) -> dict[str, Any]:
     """A game in the library."""
-    return _send(rom.fs_path, rom.fs_name, rom.platform.fs_slug, rom_id=rom.id, user_id=user_id)
+    return _send(rom.fs_path, rom.fs_name, rom.platform.fs_slug, rom_id=rom.id, user_id=user_id, target_id=target_id)
 
 
-def send_install(record: dict[str, Any], user_id: int) -> dict[str, Any]:
+def send_install(record: dict[str, Any], user_id: int, target_id: str | None = None) -> dict[str, Any]:
     """An installed hack, straight from its install record: works before the scan has made it a library game."""
-    return _send(record["fs_path"], record["fs_name"], record["platform_fs_slug"], rom_id=record.get("rom_id"), user_id=user_id)
+    return _send(record["fs_path"], record["fs_name"], record["platform_fs_slug"], rom_id=record.get("rom_id"), user_id=user_id, target_id=target_id)
 
 
-def send_install_or_record_failure(record: dict[str, Any], user_id: int) -> str:
+def send_install_or_record_failure(record: dict[str, Any], user_id: int, target_id: str | None = None) -> str:
     """For Install + Send with FTP: start the send and return its job id. A send that can't start is recorded as a
     failed job with its reason, so the install still succeeds and the page can say why the send didn't."""
     try:
-        return send_install(record, user_id)["id"]
+        return send_install(record, user_id, target_id)["id"]
     except ftp.FtpError as exc:
         log.warning(f"RomStop: not sending {record['fs_name']} with FTP: {exc}")
         return ftp.create_job(None, [], rom_id=record.get("rom_id"), user_id=user_id, dest="", status="failed", error=exc)
@@ -70,12 +76,12 @@ def _save_target(s: dict[str, Any], kind: str, asset: Any, rom: Any) -> dict[str
     }
 
 
-def save_plan(kind: str, asset: Any, rom: Any, user_id: int, folder: str | None = None, file_name: str | None = None) -> dict[str, Any]:
+def save_plan(
+    kind: str, asset: Any, rom: Any, user_id: int, folder: str | None = None, file_name: str | None = None, target_id: str | None = None
+) -> dict[str, Any]:
     """What sending this save would do: the folder from the settings, the file name on the device, and whether a
     file of that name is already there (checked over FTP; `check_error` says why it couldn't be)."""
-    s = ftp.load()
-    if not s["enabled"] or not s["host"]:
-        raise ftp.FtpError("Send with FTP is off. An admin can turn it on under Settings > Send with FTP.", "not_configured")
+    s = _target(target_id)
     target = _save_target(s, kind, asset, rom)
     dest_dir = ftp.clean_remote_dir(folder) if folder else target["settings_dir"]
     name = ftp.clean_file_name(file_name) if file_name else target["file_name"]
@@ -83,6 +89,7 @@ def save_plan(kind: str, asset: Any, rom: Any, user_id: int, folder: str | None 
         **target,
         "kind": kind,
         "target": ftp.target_name(s),
+        "target_id": s["id"],
         "console": rom.platform.custom_name or rom.platform.name or rom.platform.fs_slug,
         "game": rom.name or rom.fs_name_no_ext,
         "emulator": asset.emulator,
@@ -100,10 +107,10 @@ def save_plan(kind: str, asset: Any, rom: Any, user_id: int, folder: str | None 
     return out
 
 
-def send_save(kind: str, asset: Any, rom: Any, user_id: int, folder: str | None, file_name: str | None, replace: bool) -> dict[str, Any]:
-    s = ftp.load()
-    if not s["enabled"] or not s["host"]:
-        raise ftp.FtpError("Send with FTP is off. An admin can turn it on under Settings > Send with FTP.", "not_configured")
+def send_save(
+    kind: str, asset: Any, rom: Any, user_id: int, folder: str | None, file_name: str | None, replace: bool, target_id: str | None = None
+) -> dict[str, Any]:
+    s = _target(target_id)
     target = _save_target(s, kind, asset, rom)
     dest_dir = ftp.clean_remote_dir(folder) if folder else target["settings_dir"]
     if not dest_dir:

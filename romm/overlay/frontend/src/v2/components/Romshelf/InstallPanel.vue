@@ -27,7 +27,7 @@ import romshelfApi, {
 import { useCan } from "@/v2/composables/useCan";
 import { useSnackbar } from "@/v2/composables/useSnackbar";
 import { browserCoreFor, rememberHackCore } from "@/v2/components/Romshelf/compat";
-import { useFtpStatus } from "@/v2/components/Romshelf/ftp";
+import { pickTarget, useFtpStatus } from "@/v2/components/Romshelf/ftp";
 import SendFtpButton from "@/v2/components/Romshelf/SendFtpButton.vue";
 
 const props = defineProps<{
@@ -88,6 +88,12 @@ const hacksFolder = useUserLocalStorage("romstop.install.hacksFolder", false);
 // Send with FTP (set up by an admin): push the installed hack to the device right after installing it.
 const ftp = useFtpStatus();
 const sendAfterInstall = useUserLocalStorage("romstop.install.sendFtp", false);
+// With several devices: which one to send to after installing (remembered; the default when it's gone).
+const ftpTargetPref = useUserLocalStorage("romstop.install.ftpTarget", "");
+const afterTarget = computed(() => pickTarget(ftp.value, ftpTargetPref.value));
+const ftpTargetItems = computed(() =>
+  ftp.value.targets.map((x) => ({ value: x.id, title: x.name })),
+);
 const ftpButton = ref<InstanceType<typeof SendFtpButton> | null>(null);
 // Sending works on the patched file, so it doesn't wait for RomM's scan: the button follows the latest install.
 const lastInstall = ref<RomshelfInstall | null>(null);
@@ -201,6 +207,7 @@ async function submit(replace = false) {
       replace: replace || previousCode === "already_installed",
       hacksFolder: hacksFolder.value,
       sendFtp: sendAfterInstall.value && ftp.value.enabled,
+      ftpTarget: afterTarget.value?.id ?? null,
     });
     if (!data.checksum_validated) {
       snackbar.warning(t("romshelf.checksum-warning"), { timeout: 6000 });
@@ -471,13 +478,31 @@ function onFiles(files: File[]) {
       hide-details
     />
 
-    <RCheckbox
-      v-if="ftp.enabled && canInstall"
-      v-model="sendAfterInstall"
-      :label="t('romshelf.ftp-after-install', { target: ftp.name })"
-      :disabled="installing || !!pendingRecord"
-      hide-details
-    />
+    <div v-if="ftp.enabled && canInstall" class="r-v2-rs-install__ftp">
+      <RCheckbox
+        v-model="sendAfterInstall"
+        :label="
+          t('romshelf.ftp-after-install', {
+            target: afterTarget?.name ?? ftp.name,
+          })
+        "
+        :disabled="installing || !!pendingRecord"
+        hide-details
+      />
+      <RSelect
+        v-if="sendAfterInstall && ftp.targets.length > 1"
+        :model-value="afterTarget?.id ?? ''"
+        :items="ftpTargetItems"
+        item-title="title"
+        item-value="value"
+        :aria-label="t('romshelf.ftp-target-pick')"
+        density="compact"
+        hide-details
+        :disabled="installing || !!pendingRecord"
+        class="r-v2-rs-install__ftp-target"
+        @update:model-value="ftpTargetPref = String($event)"
+      />
+    </div>
 
     <div class="r-v2-rs-install__actions">
       <RBtn
@@ -612,5 +637,14 @@ function onFiles(files: File[]) {
   margin-left: auto;
   color: var(--r-color-fg-muted);
   font-size: var(--r-font-size-xs);
+}
+.r-v2-rs-install__ftp {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--r-space-2);
+}
+.r-v2-rs-install__ftp-target {
+  width: 200px;
 }
 </style>

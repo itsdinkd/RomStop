@@ -3,7 +3,7 @@
 // RomM uploads the file to the FTP target an admin set up under Settings > Send with FTP,
 // say a PS5's FTP payload next to RetroArch, into <base path>/<console folder>/[Hacks/].
 // Hidden while Send with FTP is off.
-import { RBtn, RSpinner } from "@v2/lib";
+import { RBtn, RMenu, RMenuItem, RSpinner } from "@v2/lib";
 import { computed, onBeforeUnmount, ref, watch } from "vue";
 import { useI18n } from "vue-i18n";
 import romshelfApi, {
@@ -47,13 +47,17 @@ const progress = computed(() => {
   });
 });
 
-async function send() {
+// With several devices set up, the button opens a menu of them (the default first).
+const several = computed(() => ftp.value.targets.length > 1);
+
+async function send(target?: string) {
   if (busy.value || !visible.value) return;
   starting.value = true;
   try {
     const { data } = await romshelfApi.sendWithFtp({
       installId: props.installId,
       romId: props.romId,
+      target: target ?? null,
     });
     job.value = data;
     follow(data);
@@ -131,7 +135,30 @@ defineExpose({ send, track, visible });
 
 <template>
   <span v-if="visible" class="r-v2-rs-ftp">
+    <RMenu v-if="several" location="bottom start" :offset="6">
+      <template #activator="{ props: activatorProps }">
+        <RBtn
+          v-bind="activatorProps"
+          variant="outlined"
+          :size="size"
+          prepend-icon="mdi-upload-network-outline"
+          append-icon="mdi-chevron-down"
+          :loading="starting"
+          :disabled="busy"
+        >
+          {{ t("romshelf.ftp-send") }}
+        </RBtn>
+      </template>
+      <RMenuItem
+        v-for="target in ftp.targets"
+        :key="target.id"
+        :label="t('romshelf.ftp-send-to', { target: target.name })"
+        icon="mdi-access-point-network"
+        @click="send(target.id)"
+      />
+    </RMenu>
     <RBtn
+      v-else
       variant="outlined"
       :size="size"
       prepend-icon="mdi-upload-network-outline"
@@ -140,7 +167,7 @@ defineExpose({ send, track, visible });
       :title="
         ftp.name ? t('romshelf.ftp-send-to', { target: ftp.name }) : undefined
       "
-      @click="send"
+      @click="send()"
     >
       {{ t("romshelf.ftp-send") }}
     </RBtn>
