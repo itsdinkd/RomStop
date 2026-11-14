@@ -14,6 +14,7 @@ import hashlib
 import json
 import os
 import posixpath
+import re
 import sqlite3
 import threading
 import time
@@ -21,7 +22,7 @@ import uuid
 from collections.abc import Callable, Iterator
 from contextlib import closing
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 from cryptography.fernet import Fernet, InvalidToken
@@ -35,6 +36,9 @@ JOBS_DB = ROMSHELF_DIR / "ftp.sqlite"
 
 HACKS_MODES = ("match", "always", "never")
 EXISTING_MODES = ("replace", "skip")
+# RetroArch's save/state folder layouts: flat, "Sort Saves into Folders by Core Name" (core), "...by Content
+# Directory" (content: the folder the game sits in on the device), or both (core_content: <core>/<content dir>).
+SAVE_LAYOUTS = ("flat", "core", "content", "core_content")
 
 DEFAULTS: dict[str, Any] = {
     "enabled": False,
@@ -53,6 +57,10 @@ DEFAULTS: dict[str, Any] = {
     "hacks_folder": "Hacks",
     "existing": "replace",
     "timeout": 30,
+    # Saves and save states: RetroArch's saves and states folders on the device ("" = not set up).
+    "saves_path": "",
+    "states_path": "",
+    "saves_layout": "flat",
 }
 
 # Starting points for the settings form, not hardcoded behavior: every value can be changed after picking one.
@@ -61,8 +69,9 @@ PRESETS: dict[str, dict[str, Any]] = {
         "label": "PS5 (RetroArch)",
         "description": (
             "A jailbroken PS5 running an FTP server payload, with RetroArch reading games from its content folder, "
-            "one folder per console (content/snes, content/nes...). The etaHEN FTP server listens on port 1337; "
-            "the standalone ftpsrv payload uses 2121. Check the content path with any FTP client first."
+            "one folder per console (content/snes, content/nes...). The base path is RetroArch's content folder, "
+            "/data/homebrew/<RetroArch's title id>/content (PPSA99169 on one tested install). The etaHEN FTP server "
+            "listens on port 1337; the standalone ftpsrv payload uses 2121. Test connection lists the folders it finds."
         ),
         "settings": {
             "name": "PS5",
@@ -70,11 +79,14 @@ PRESETS: dict[str, dict[str, Any]] = {
             "username": "",
             "tls": False,
             "passive": True,
-            "base_path": "/content",
+            "base_path": "/data/homebrew/PPSA99169/content",
             "folders": {},
             "hacks": "match",
             "hacks_folder": "Hacks",
             "existing": "replace",
+            "saves_path": "/data/homebrew/PPSA99169/saves",
+            "states_path": "/data/homebrew/PPSA99169/states",
+            "saves_layout": "flat",
         },
     },
     "retroarch": {
@@ -149,6 +161,11 @@ def _validate(raw: dict[str, Any]) -> dict[str, Any]:
     if s["hacks"] not in HACKS_MODES:
         raise FtpError("Hacks folder must be match, always or never.", "bad_settings")
     s["hacks_folder"] = _clean_folder(s["hacks_folder"], "Hacks folder") or "Hacks"
+    for key, label in (("saves_path", "Saves folder"), ("states_path", "Save states folder")):
+        folder = _clean_folder(s[key], label)
+        s[key] = "/" + folder if folder else ""
+    if s["saves_layout"] not in SAVE_LAYOUTS:
+        raise FtpError("Save folder layout must be flat, core, content or core_content.", "bad_settings")
     if s["existing"] not in EXISTING_MODES:
         raise FtpError("Existing files must be replaced or skipped.", "bad_settings")
     if s["enabled"] and not s["host"]:
@@ -237,6 +254,8 @@ class Upload:
     local: Path
     remote: str
     size: int
+    # Saves: a file already on the device is renamed to "<name>.bak-<time>" first, never overwritten.
+    backup: bool = False
 
 
 def plan(local_path: Path, dest_dir: str) -> list[Upload]:
@@ -253,6 +272,59 @@ def plan(local_path: Path, dest_dir: str) -> list[Upload]:
     if not out:
         raise FtpError(f"{local_path.name} is an empty folder.", "missing_file", 404)
     return out
+
+
+_VERSION_TAG = re.compile(r" \[\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}\]")
+
+
+def device_save_name(asset_file_name: str, rom_stem: str) -> str:
+    """The name RetroArch looks for: the game's file name with the save's ending (".srm", ".state1", ".state.auto").
+    RomM's version tag (" [2026-11-04_02-33-57]") is dropped."""
+    name = _VERSION_TAG.sub("", asset_file_name)
+    if rom_stem and name.lower().startswith(rom_stem.lower()) and len(name) > len(rom_stem):
+        suffix = name[len(rom_stem):]
+    else:
+        suffix = PurePosixPath(name).suffix
+        # ".state.auto" keeps both parts.
+        if suffix == ".auto" and PurePosixPath(PurePosixPath(name).stem).suffix.startswith(".state"):
+            suffix = PurePosixPath(PurePosixPath(name).stem).suffix + suffix
+    return f"{rom_stem}{suffix}" if rom_stem else name
+
+
+def save_dir(s: dict[str, Any], kind: str, core_dir: str | None, content_dir: str | None) -> str | None:
+    """The device folder for a save ("save") or state ("state") under the settings; None while that folder isn't set."""
+    base = s["saves_path"] if kind == "save" else s["states_path"]
+    if not base:
+        return None
+    parts = [base]
+    if s["saves_layout"] in ("core", "core_content") and core_dir:
+        parts.append(_clean_folder(core_dir, "Core folder"))
+    if s["saves_layout"] in ("content", "core_content") and content_dir:
+        parts.append(_clean_folder(content_dir, "Content folder"))
+    return posixpath.normpath(posixpath.join(*[p for p in parts if p]))
+
+
+def clean_remote_dir(path: str) -> str:
+    """A folder typed in by hand: absolute, no '.' or '..'."""
+    folder = _clean_folder(path, "Folder")
+    if not folder:
+        raise FtpError("Enter a folder on the device, such as /data/homebrew/PPSA99169/saves.", "bad_path")
+    return "/" + folder
+
+
+def clean_file_name(name: str) -> str:
+    name = (name or "").strip()
+    if not name or "/" in name or "\\" in name or name in (".", ".."):
+        raise FtpError("Enter a file name without folders.", "bad_name")
+    return name
+
+
+def remote_exists(s: dict[str, Any], path: str, factory: Callable[..., ftplib.FTP] | None = None) -> bool:
+    ftp = connect(s, factory)
+    try:
+        return remote_size(ftp, path) is not None
+    finally:
+        _quit(ftp)
 
 
 # ------------------------------------------------------------------ FTP
@@ -347,7 +419,13 @@ def send(
     try:
         for up in uploads:
             make_dirs(ftp, posixpath.dirname(up.remote))
-            if s["existing"] == "skip" and remote_size(ftp, up.remote) is not None:
+            if up.backup and remote_size(ftp, up.remote) is not None:
+                keep = f"{up.remote}.bak-{time.strftime('%Y%m%d-%H%M%S')}"
+                try:
+                    ftp.rename(up.remote, keep)
+                except ftplib.error_perm as exc:
+                    raise FtpError(f"Couldn't keep a copy of the save already on the device ({exc}), so nothing was sent.", "backup_failed") from exc
+            elif not up.backup and s["existing"] == "skip" and remote_size(ftp, up.remote) is not None:
                 skipped += 1
                 done += up.size
                 if progress:
@@ -381,12 +459,21 @@ def _jobs() -> sqlite3.Connection:
     con = sqlite3.connect(JOBS_DB, timeout=10)
     con.execute(
         "CREATE TABLE IF NOT EXISTS jobs (id TEXT PRIMARY KEY, rom_id INTEGER, user_id INTEGER, status TEXT, total INTEGER, done INTEGER,"
-        " current TEXT, message TEXT, code TEXT, sent INTEGER, skipped INTEGER, target TEXT, dest TEXT, started REAL, updated REAL)"
+        " current TEXT, message TEXT, code TEXT, sent INTEGER, skipped INTEGER, target TEXT, dest TEXT, started REAL, updated REAL,"
+        " source TEXT)"
     )
+    con.execute("CREATE TABLE IF NOT EXISTS save_paths (user_id INTEGER, path TEXT, used REAL, PRIMARY KEY (user_id, path))")
+    try:  # Added after the first release: the library file or folder being sent.
+        con.execute("ALTER TABLE jobs ADD COLUMN source TEXT")
+    except sqlite3.OperationalError:
+        pass
     return con
 
 
-_JOB_FIELDS = ("id", "rom_id", "user_id", "status", "total", "done", "current", "message", "code", "sent", "skipped", "target", "dest", "started", "updated")
+_JOB_FIELDS = (
+    "id", "rom_id", "user_id", "status", "total", "done", "current", "message", "code", "sent", "skipped", "target", "dest",
+    "started", "updated", "source",
+)
 _STALE_SECONDS = 600
 
 
@@ -396,15 +483,16 @@ def job(job_id: str) -> dict[str, Any] | None:
     if not row:
         return None
     out = dict(zip(_JOB_FIELDS, row))
-    # A job whose worker died (RomM restarted mid-transfer) would otherwise read as running forever.
+    # A job whose thread died (RomM restarted mid-transfer) would otherwise read as running forever.
     if out["status"] == "running" and time.time() - (out["updated"] or 0) > _STALE_SECONDS:
         out["status"], out["code"], out["message"] = "failed", "stalled", "The transfer stopped answering. Try sending again."
     return out
 
 
-def running_for(rom_id: int) -> dict[str, Any] | None:
+def running_for(source: str) -> dict[str, Any] | None:
+    """A send of this library file that is under way, so a second click doesn't start another."""
     with closing(_jobs()) as con:
-        row = con.execute("SELECT id FROM jobs WHERE rom_id = ? AND status = 'running' ORDER BY started DESC LIMIT 1", (rom_id,)).fetchone()
+        row = con.execute("SELECT id FROM jobs WHERE source = ? AND status = 'running' ORDER BY started DESC LIMIT 1", (source,)).fetchone()
     found = job(row[0]) if row else None
     return found if found and found["status"] == "running" else None
 
@@ -415,27 +503,64 @@ def _update(job_id: str, **fields: Any) -> None:
         con.execute(f"UPDATE jobs SET {', '.join(f'{k} = ?' for k in fields)} WHERE id = ?", (*fields.values(), job_id))
 
 
-def start(
-    s: dict[str, Any],
-    uploads: list[Upload],
-    *,
-    rom_id: int,
-    user_id: int,
-    dest: str,
-    factory: Callable[..., ftplib.FTP] | None = None,
-    background: bool = True,
-) -> dict[str, Any]:
-    """Record a job and run the transfer in a thread. Poll `job(id)` for progress."""
-    job_id = uuid.uuid4().hex
-    now = time.time()
-    total = sum(u.size for u in uploads)
+def remember_path(user_id: int, path: str) -> None:
+    """A folder typed in by hand, offered again next time (newest first)."""
     with closing(_jobs()) as con, con:
         con.execute(
-            "INSERT INTO jobs (id, rom_id, user_id, status, total, done, current, message, code, sent, skipped, target, dest, started, updated)"
-            " VALUES (?, ?, ?, 'running', ?, 0, NULL, NULL, NULL, 0, 0, ?, ?, ?, ?)",
-            (job_id, rom_id, user_id, total, target_name(s), dest, now, now),
+            "INSERT INTO save_paths (user_id, path, used) VALUES (?, ?, ?) ON CONFLICT (user_id, path) DO UPDATE SET used = excluded.used",
+            (user_id, path, time.time()),
         )
 
+
+def recent_paths(user_id: int, limit: int = 15) -> list[str]:
+    with closing(_jobs()) as con:
+        return [r[0] for r in con.execute("SELECT path FROM save_paths WHERE user_id = ? ORDER BY used DESC LIMIT ?", (user_id, limit))]
+
+
+def forget_path(user_id: int, path: str) -> None:
+    with closing(_jobs()) as con, con:
+        con.execute("DELETE FROM save_paths WHERE user_id = ? AND path = ?", (user_id, path))
+
+
+def create_job(
+    s: dict[str, Any] | None,
+    uploads: list[Upload],
+    *,
+    rom_id: int | None,
+    user_id: int,
+    dest: str,
+    source: str = "",
+    status: str = "running",
+    error: FtpError | None = None,
+) -> str:
+    """Record a send. `failed` (with `error`) records a send that couldn't start, so the page can say why."""
+    job_id = uuid.uuid4().hex
+    now = time.time()
+    with closing(_jobs()) as con, con:
+        con.execute(
+            "INSERT INTO jobs (id, rom_id, user_id, status, total, done, current, message, code, sent, skipped, target, dest, started, updated,"
+            " source) VALUES (?, ?, ?, ?, ?, 0, NULL, ?, ?, 0, 0, ?, ?, ?, ?, ?)",
+            (
+                job_id,
+                rom_id,
+                user_id,
+                status,
+                sum(u.size for u in uploads),
+                str(error) if error else None,
+                error.code if error else None,
+                target_name(s) if s else "FTP",
+                dest,
+                now,
+                now,
+                source,
+            ),
+        )
+    return job_id
+
+
+def run_job(job_id: str, s: dict[str, Any], uploads: list[Upload], factory: Callable[..., ftplib.FTP] | None = None) -> dict[str, Any]:
+    """Do the transfer for a recorded job, keeping its progress up to date. Never raises."""
+    total = sum(u.size for u in uploads)
     last = [0.0]
 
     def progress(done: int, current: str) -> None:
@@ -443,20 +568,37 @@ def start(
             last[0] = time.monotonic()
             _update(job_id, done=done, current=current)
 
-    def run() -> None:
-        try:
-            result = send(s, uploads, progress, factory)
-            _update(job_id, status="done", done=total, sent=result["sent"], skipped=result["skipped"], current=None)
-        except FtpError as exc:
-            _update(job_id, status="failed", message=str(exc), code=exc.code)
-        except Exception as exc:  # Anything else still has to end the job, or the page waits forever.
-            _update(job_id, status="failed", message=f"Sending failed: {exc}", code="error")
-
-    if background:
-        threading.Thread(target=run, name=f"romstop-ftp-{job_id[:8]}", daemon=True).start()
-    else:
-        run()
+    try:
+        result = send(s, uploads, progress, factory)
+        _update(job_id, status="done", done=total, sent=result["sent"], skipped=result["skipped"], current=None)
+    except FtpError as exc:
+        _update(job_id, status="failed", message=str(exc), code=exc.code)
+    except Exception as exc:  # Anything else still has to end the job, or the page waits forever.
+        _update(job_id, status="failed", message=f"Sending failed: {exc}", code="error")
     return job(job_id) or {}
+
+
+def start(
+    s: dict[str, Any],
+    uploads: list[Upload],
+    *,
+    rom_id: int | None,
+    user_id: int,
+    dest: str,
+    source: str = "",
+    factory: Callable[..., ftplib.FTP] | None = None,
+    background: bool = True,
+) -> dict[str, Any]:
+    """Record a job and run the transfer in a thread (RomM's web process lives on). Poll `job(id)` for progress.
+    A send of the same file already under way is returned instead of starting another."""
+    running = running_for(source) if source else None
+    if running:
+        return running
+    job_id = create_job(s, uploads, rom_id=rom_id, user_id=user_id, dest=dest, source=source)
+    if background:
+        threading.Thread(target=run_job, args=(job_id, s, uploads, factory), name=f"romstop-ftp-{job_id[:8]}", daemon=True).start()
+        return job(job_id) or {}
+    return run_job(job_id, s, uploads, factory)
 
 
 def iter_presets() -> Iterator[dict[str, Any]]:

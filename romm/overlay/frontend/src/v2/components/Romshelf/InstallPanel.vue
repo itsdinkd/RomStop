@@ -89,8 +89,11 @@ const hacksFolder = useUserLocalStorage("romstop.install.hacksFolder", false);
 const ftp = useFtpStatus();
 const sendAfterInstall = useUserLocalStorage("romstop.install.sendFtp", false);
 const ftpButton = ref<InstanceType<typeof SendFtpButton> | null>(null);
-const justInstalledRomId = ref<number | null>(null);
-const ftpRomId = computed(() => installedHere.value?.rom_id ?? justInstalledRomId.value);
+// Sending works on the patched file, so it doesn't wait for RomM's scan: the button follows the latest install.
+const lastInstall = ref<RomshelfInstall | null>(null);
+const ftpInstall = computed(
+  () => pendingRecord.value ?? lastInstall.value ?? installedHere.value ?? null,
+);
 const patchFile = ref<File | null>(null);
 const patchMember = ref<string | null>(null);
 const installing = ref(false);
@@ -197,11 +200,18 @@ async function submit(replace = false) {
       patchMember: patchMember.value,
       replace: replace || previousCode === "already_installed",
       hacksFolder: hacksFolder.value,
+      sendFtp: sendAfterInstall.value && ftp.value.enabled,
     });
     if (!data.checksum_validated) {
       snackbar.warning(t("romshelf.checksum-warning"), { timeout: 6000 });
     }
     pendingRecord.value = data;
+    lastInstall.value = data;
+    // Install + Send with FTP: the server started the send as soon as the file was written.
+    if (data.ftp_job) {
+      await nextTick();
+      ftpButton.value?.track(data.ftp_job);
+    }
     poll(0);
   } catch (err) {
     error.value = installErrorOf(err);
@@ -223,11 +233,7 @@ async function checkInstall(attempt: number) {
       if (props.platformSlug) rememberHackCore(data.rom_id, props.platformSlug, props.hack);
       pendingRecord.value = null;
       patchFile.value = null;
-      justInstalledRomId.value = data.rom_id;
-      if (sendAfterInstall.value && ftp.value.enabled) {
-        await nextTick();
-        void ftpButton.value?.send();
-      }
+      lastInstall.value = data;
       snackbar.success(
         t("romshelf.installed-toast", { title: props.hack.title }),
         {
@@ -509,9 +515,10 @@ function onFiles(files: File[]) {
         </template>
       </RSelect>
       <SendFtpButton
-        v-if="ftpRomId && !pendingRecord"
+        v-if="ftpInstall"
         ref="ftpButton"
-        :rom-id="ftpRomId"
+        :install-id="ftpInstall.id"
+        :job-id="installedHere?.ftp_job ?? null"
         :title="hack.title"
       />
       <span v-if="pendingRecord" class="r-v2-rs-install__pending">

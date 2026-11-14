@@ -197,6 +197,9 @@ def _add_record(
         "checksum_validated": validated,
         "status": "pending",
         "rom_id": None,
+        # Send with FTP works on the file, before the scan: it needs the platform's folder name, and keeps its job.
+        "platform_fs_slug": platform.fs_slug,
+        "ftp_job": None,
         # What finalize writes onto the new ROM; kept here so the worker needs no index.
         "metadata": _metadata_for(hack, version, base_rom),
     }
@@ -369,6 +372,21 @@ async def finalize(record_id: str) -> dict[str, Any] | None:
                 record = r
     log.info(f"RomStop: {record['fs_name']} is ROM {rom.id}")
     return record
+
+
+def get_record(record_id: str) -> dict[str, Any] | None:
+    return next((r for r in all_records() if r["id"] == record_id), None)
+
+
+def set_ftp_job(record_id: str, job_id: str) -> dict[str, Any] | None:
+    """Remember the install's latest Send with FTP, so the page can show it after a reload."""
+    found = None
+    with _locked() as records:
+        for r in records:
+            if r["id"] == record_id:
+                r["ftp_job"] = job_id
+                found = r
+    return found
 
 
 async def finalize_pending() -> None:

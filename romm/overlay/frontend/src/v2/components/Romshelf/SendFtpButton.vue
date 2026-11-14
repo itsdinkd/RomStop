@@ -4,7 +4,7 @@
 // say a PS5's FTP payload next to RetroArch, into <base path>/<console folder>/[Hacks/].
 // Hidden while Send with FTP is off.
 import { RBtn, RSpinner } from "@v2/lib";
-import { computed, onBeforeUnmount, ref } from "vue";
+import { computed, onBeforeUnmount, ref, watch } from "vue";
 import { useI18n } from "vue-i18n";
 import romshelfApi, {
   installErrorOf,
@@ -15,8 +15,16 @@ import { useSnackbar } from "@/v2/composables/useSnackbar";
 import { formatBytes, useFtpStatus } from "@/v2/components/Romshelf/ftp";
 
 const props = withDefaults(
-  defineProps<{ romId: number; title?: string; size?: "small" | "default" }>(),
-  { title: "", size: "default" },
+  defineProps<{
+    /** An install (works before RomM's scan has added it), or a library game. */
+    installId?: string | null;
+    romId?: number | null;
+    title?: string;
+    size?: "small" | "default";
+    /** A send RomM's server started by itself (after an install); shown while it is still going. */
+    jobId?: string | null;
+  }>(),
+  { title: "", size: "default", jobId: null, installId: null, romId: null },
 );
 
 const { t } = useI18n();
@@ -43,7 +51,10 @@ async function send() {
   if (busy.value || !visible.value) return;
   starting.value = true;
   try {
-    const { data } = await romshelfApi.sendWithFtp(props.romId);
+    const { data } = await romshelfApi.sendWithFtp({
+      installId: props.installId,
+      romId: props.romId,
+    });
     job.value = data;
     follow(data);
   } catch (err) {
@@ -89,11 +100,33 @@ async function poll(id: string) {
   }
 }
 
+// Follow a send the server started. With `quietIfOver`, a send that already ended says nothing
+// (the page was opened later); otherwise its result is shown like a click's.
+async function track(id: string, quietIfOver = false) {
+  if (!/^[0-9a-f]{32}$/.test(id) || job.value?.id === id) return;
+  try {
+    const { data } = await romshelfApi.getFtpJob(id);
+    if (quietIfOver && data.status !== "running") return;
+    job.value = data;
+    follow(data);
+  } catch {
+    /* an unknown or expired job: nothing to show */
+  }
+}
+
+watch(
+  () => props.jobId,
+  (id) => {
+    if (id) void track(id, true);
+  },
+  { immediate: true },
+);
+
 onBeforeUnmount(() => {
   if (timer) clearTimeout(timer);
 });
 
-defineExpose({ send, visible });
+defineExpose({ send, track, visible });
 </script>
 
 <template>

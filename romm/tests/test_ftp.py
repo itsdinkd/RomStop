@@ -106,6 +106,11 @@ class FakeFtp:
                 callback(chunk)
         self.files[path] = data
 
+    def rename(self, src, dst):
+        if src not in self.files:
+            raise ftplib.error_perm("550 No such file")
+        self.files[dst] = self.files.pop(src)
+
     def quit(self):
         self.closed = True
 
@@ -257,21 +262,184 @@ class TransferTests(unittest.TestCase):
         server = FakeFtp()
         s = self.settings()
         uploads = self.mod.plan(self.rom, "/content/snes")
-        job = self.mod.start(s, uploads, rom_id=7, user_id=1, dest="/content/snes", factory=server, background=False)
+        job = self.mod.start(s, uploads, rom_id=7, user_id=1, dest="/content/snes", source="a", factory=server, background=False)
         self.assertEqual(job["status"], "done")
         self.assertEqual((job["done"], job["total"], job["sent"]), (self.rom.stat().st_size, self.rom.stat().st_size, 1))
         self.assertEqual(job["target"], "ps5")
-        self.assertIsNone(self.mod.running_for(7))
+        self.assertIsNone(self.mod.running_for("a"))
 
         failed = self.mod.start(s, uploads, rom_id=8, user_id=1, dest="/x", factory=FakeFtp(fail_stor=True), background=False)
         self.assertEqual((failed["status"], failed["code"]), ("failed", "refused"))
 
+    def test_a_second_click_returns_the_send_under_way(self):
+        s = self.settings()
+        uploads = self.mod.plan(self.rom, "/content/snes")
+        job_id = self.mod.create_job(s, uploads, rom_id=None, user_id=1, dest="/content/snes", source=str(self.rom))
+        again = self.mod.start(s, uploads, rom_id=10, user_id=1, dest="/content/snes", source=str(self.rom), factory=FakeFtp(), background=False)
+        self.assertEqual(again["id"], job_id)
+        out = self.mod.run_job(job_id, s, uploads, factory=FakeFtp())
+        self.assertEqual((out["status"], out["sent"]), ("done", 1))
+
+    def test_a_send_that_cannot_start_is_recorded_with_its_reason(self):
+        err = self.mod.FtpError("Send with FTP is off.", "not_configured")
+        job_id = self.mod.create_job(None, [], rom_id=11, user_id=1, dest="", status="failed", error=err)
+        self.assertEqual((self.mod.job(job_id)["code"], self.mod.job(job_id)["message"]), ("not_configured", "Send with FTP is off."))
+
     def test_a_job_left_running_by_a_restart_reads_as_failed(self):
-        job = self.mod.start(self.settings(), [], rom_id=9, user_id=1, dest="/x", factory=FakeFtp(), background=False)
+        job = self.mod.start(self.settings(), [], rom_id=9, user_id=1, dest="/x", source="b", factory=FakeFtp(), background=False)
         self.mod._update(job["id"], status="running")
         with mock.patch.object(self.mod.time, "time", return_value=job["updated"] + 3600):
             self.assertEqual(self.mod.job(job["id"])["code"], "stalled")
-            self.assertIsNone(self.mod.running_for(9))
+            self.assertIsNone(self.mod.running_for("b"))
+
+    def test_job_files_from_the_first_release_get_the_new_column(self):
+        import sqlite3
+
+        con = sqlite3.connect(self.tmp / "ftp.sqlite")
+        con.execute(
+            "CREATE TABLE jobs (id TEXT PRIMARY KEY, rom_id INTEGER, user_id INTEGER, status TEXT, total INTEGER, done INTEGER,"
+            " current TEXT, message TEXT, code TEXT, sent INTEGER, skipped INTEGER, target TEXT, dest TEXT, started REAL, updated REAL)"
+        )
+        con.close()
+        job = self.mod.start(self.settings(), [], rom_id=1, user_id=1, dest="/x", source="c", factory=FakeFtp(), background=False)
+        self.assertEqual((job["status"], job["source"]), ("done", "c"))
+
+
+_SEND_PATH = Path(__file__).resolve().parents[1] / "overlay/backend/handler/romshelf/ftp_send.py"
+
+
+class SendTests(unittest.TestCase):
+    """ftp_send: sending works on the library file, so an install is sent before RomM's scan adds it."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.library = self.tmp / "library"
+        (self.library / "roms/snes/Hacks").mkdir(parents=True)
+        (self.library / "roms/snes/Hacks/Hack [RomStop].sfc").write_bytes(b"rom")
+        self.ftp = _load(self.tmp / "resources")
+        self.server = FakeFtp(dirs=("/content",))
+        library = self.library
+        stubs = {
+            "config": types.SimpleNamespace(ROMM_AUTH_SECRET_KEY="k"),
+            "config.config_manager": types.SimpleNamespace(ROMSTOP_HACKS_FOLDER="Hacks"),
+            "handler": types.ModuleType("handler"),
+            "handler.filesystem": types.SimpleNamespace(
+                fs_rom_handler=types.SimpleNamespace(validate_path=lambda p: library / p),
+                fs_asset_handler=types.SimpleNamespace(validate_path=lambda p: library / p),
+            ),
+            "handler.sync": types.ModuleType("handler.sync"),
+            "handler.sync.retroarch": types.ModuleType("handler.sync.retroarch"),
+            "handler.sync.retroarch.emulator_names": types.SimpleNamespace(RETROARCH_DIR_BY_ROMM_EMULATOR={"snes9x": "Snes9x"}),
+            "logger.logger": types.SimpleNamespace(log=mock.Mock()),
+            "handler.romshelf": types.ModuleType("handler.romshelf"),
+            "handler.romshelf.ftp": self.ftp,
+        }
+        stubs["handler.romshelf"].ftp = self.ftp
+        with mock.patch.dict(sys.modules, stubs):
+            spec = importlib.util.spec_from_file_location("handler.romshelf.ftp_send", _SEND_PATH)
+            self.mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(self.mod)
+        # Run transfers inline against the fake server.
+        real_start = self.ftp.start
+        self.ftp.start = lambda *a, **kw: real_start(*a, **{**kw, "factory": self.server, "background": False})
+        real_exists = self.ftp.remote_exists
+        self.ftp.remote_exists = lambda s, path: real_exists(s, path, self.server)
+        self.record = {"id": "r1", "fs_path": "roms/snes/Hacks", "fs_name": "Hack [RomStop].sfc", "platform_fs_slug": "snes", "rom_id": None}
+
+    def test_an_install_is_sent_before_the_scan(self):
+        self.ftp.save({"enabled": True, "host": "ps5", "base_path": "/content"})
+        job_id = self.mod.send_install_or_record_failure(self.record, 1)
+        job = self.ftp.job(job_id)
+        self.assertEqual((job["status"], job["dest"], job["rom_id"]), ("done", "/content/snes/Hacks", None))
+        self.assertEqual(self.server.files["/content/snes/Hacks/Hack [RomStop].sfc"], b"rom")
+
+    def test_a_library_game_is_sent_the_same_way(self):
+        self.ftp.save({"enabled": True, "host": "ps5", "base_path": "/content", "folders": {"snes": "SNES"}})
+        rom = types.SimpleNamespace(id=5, fs_path="roms/snes/Hacks", fs_name="Hack [RomStop].sfc", platform=types.SimpleNamespace(fs_slug="snes"))
+        job = self.mod.send_rom(rom, 1)
+        self.assertEqual((job["status"], job["rom_id"]), ("done", 5))
+        self.assertIn("/content/SNES/Hacks/Hack [RomStop].sfc", self.server.files)
+
+    def test_an_install_still_succeeds_when_the_send_cannot_start(self):
+        job = self.ftp.job(self.mod.send_install_or_record_failure(self.record, 1))  # Send with FTP is off
+        self.assertEqual((job["status"], job["code"]), ("failed", "not_configured"))
+        self.ftp.save({"enabled": True, "host": "ps5"})
+        missing = {**self.record, "fs_name": "Gone.sfc"}
+        job = self.ftp.job(self.mod.send_install_or_record_failure(missing, 1))
+        self.assertEqual((job["status"], job["code"]), ("failed", "missing_file"))
+        with self.assertRaises(self.ftp.FtpError):
+            self.mod.send_install(missing, 1)  # the Send button shows the reason instead
+
+    # ---- saves and save states
+
+    def _save(self, file_name="Hack [RomStop] [2026-11-04_02-33-57].srm", emulator="snes9x"):
+        (self.library / "assets/saves").mkdir(parents=True, exist_ok=True)
+        (self.library / "assets/saves" / file_name).write_bytes(b"save-data")
+        platform = types.SimpleNamespace(fs_slug="snes", name="Super Nintendo", custom_name=None)
+        rom = types.SimpleNamespace(id=5, name="Hack", fs_path="roms/snes/Hacks", fs_name="Hack [RomStop].sfc", fs_name_no_ext="Hack [RomStop]", platform=platform)
+        asset = types.SimpleNamespace(file_name=file_name, full_path=f"assets/saves/{file_name}", emulator=emulator)
+        return asset, rom
+
+    def test_save_names_follow_the_game_file_the_way_retroarch_looks_for_them(self):
+        n = self.ftp.device_save_name
+        self.assertEqual(n("Hack [RomStop] [2026-11-04_02-33-57].srm", "Hack [RomStop]"), "Hack [RomStop].srm")
+        self.assertEqual(n("Other name.state1", "Hack [RomStop]"), "Hack [RomStop].state1")
+        self.assertEqual(n("x.state.auto", "Game"), "Game.state.auto")
+        self.assertEqual(n("x.srm", ""), "x.srm")
+
+    def test_save_folders_from_the_settings_and_their_subfolders(self):
+        self.ftp.save({"enabled": True, "host": "ps5", "base_path": "/content", "saves_path": "/saves", "states_path": "states/"})
+        s = self.ftp.load()
+        self.assertEqual((s["saves_path"], s["states_path"]), ("/saves", "/states"))
+        self.assertEqual(self.ftp.save_dir(s, "save", "Snes9x", "snes"), "/saves")
+        self.assertEqual(self.ftp.save_dir({**s, "saves_layout": "core"}, "state", "Snes9x", "snes"), "/states/Snes9x")
+        self.assertEqual(self.ftp.save_dir({**s, "saves_layout": "core_content"}, "save", "Snes9x", "Hacks"), "/saves/Snes9x/Hacks")
+        self.assertIsNone(self.ftp.save_dir({**s, "states_path": ""}, "state", None, "snes"))
+        with self.assertRaises(self.ftp.FtpError):
+            self.ftp.save({"saves_layout": "sideways"})
+        with self.assertRaises(self.ftp.FtpError):
+            self.ftp.clean_remote_dir("/saves/../etc")
+
+    def test_a_save_goes_to_the_settings_folder_and_never_overwrites_without_asking(self):
+        self.ftp.save({"enabled": True, "host": "ps5", "base_path": "/content", "saves_path": "/saves", "saves_layout": "core"})
+        asset, rom = self._save()
+        plan = self.mod.save_plan("save", asset, rom, 1)
+        self.assertEqual((plan["path"], plan["exists"], plan["console"], plan["core_dir"]), ("/saves/Snes9x/Hack [RomStop].srm", False, "Super Nintendo", "Snes9x"))
+        job = self.mod.send_save("save", asset, rom, 1, None, None, False)
+        self.assertEqual((job["status"], job["dest"]), ("done", "/saves/Snes9x"))
+        self.assertEqual(self.server.files["/saves/Snes9x/Hack [RomStop].srm"], b"save-data")
+        self.assertEqual(self.ftp.recent_paths(1), [])  # the settings folder isn't a typed-in one
+
+        self.server.files["/saves/Snes9x/Hack [RomStop].srm"] = b"played-on-ps5"
+        self.assertTrue(self.mod.save_plan("save", asset, rom, 1)["exists"])
+        with self.assertRaises(self.ftp.FtpError) as ctx:
+            self.mod.send_save("save", asset, rom, 1, None, None, False)
+        self.assertEqual((ctx.exception.code, ctx.exception.status), ("exists", 409))
+        self.assertEqual(self.server.files["/saves/Snes9x/Hack [RomStop].srm"], b"played-on-ps5")
+
+        self.mod.send_save("save", asset, rom, 1, None, None, True)
+        backups = [v for k, v in self.server.files.items() if ".srm.bak-" in k]
+        self.assertEqual(backups, [b"played-on-ps5"])
+        self.assertEqual(self.server.files["/saves/Snes9x/Hack [RomStop].srm"], b"save-data")
+
+    def test_a_typed_folder_and_name_are_used_and_the_folder_remembered(self):
+        self.ftp.save({"enabled": True, "host": "ps5", "base_path": "/content"})
+        asset, rom = self._save("Hack.state1", emulator=None)
+        plan = self.mod.save_plan("state", asset, rom, 1)
+        self.assertEqual((plan["settings_dir"], plan["path"], plan["core_dir"]), (None, None, None))
+        with self.assertRaises(self.ftp.FtpError) as ctx:
+            self.mod.send_save("state", asset, rom, 1, None, None, False)
+        self.assertEqual(ctx.exception.code, "no_save_folder")
+
+        self.mod.send_save("state", asset, rom, 1, "data/states/", "Mine.state1", False)
+        self.mod.send_save("state", asset, rom, 2, "/other", None, False)
+        self.assertIn("/data/states/Mine.state1", self.server.files)
+        self.assertEqual(self.ftp.recent_paths(1), ["/data/states"])
+        self.assertEqual(self.mod.save_plan("state", asset, rom, 1)["recent_paths"], ["/data/states"])
+        self.ftp.forget_path(1, "/data/states")
+        self.assertEqual(self.ftp.recent_paths(1), [])
+        with self.assertRaises(self.ftp.FtpError):
+            self.mod.send_save("state", asset, rom, 1, "/data", "../x", False)
 
 
 try:
@@ -322,6 +490,16 @@ class RealServerTests(unittest.TestCase):
         self.assertEqual(self.mod.send(s, uploads), {"sent": 1, "skipped": 0})
         self.mod.save({"existing": "skip"})
         self.assertEqual(self.mod.send(self.mod.load(), uploads), {"sent": 0, "skipped": 1})
+
+        # A save already on the device is renamed to .bak-<time> before the new one is written.
+        save = self.tmp / "Game.srm"
+        save.write_bytes(b"new")
+        (self.root / "saves").mkdir()
+        (self.root / "saves/Game.srm").write_bytes(b"old")
+        self.assertTrue(self.mod.remote_exists(s, "/saves/Game.srm"))
+        self.assertEqual(self.mod.send(s, [self.mod.Upload(save, "/saves/Game.srm", 3, backup=True)]), {"sent": 1, "skipped": 0})
+        self.assertEqual((self.root / "saves/Game.srm").read_bytes(), b"new")
+        self.assertEqual([p.read_bytes() for p in (self.root / "saves").glob("Game.srm.bak-*")], [b"old"])
 
         self.mod.save({"password": "wrong"})
         with self.assertRaises(self.mod.FtpError) as ctx:
