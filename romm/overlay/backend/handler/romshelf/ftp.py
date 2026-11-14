@@ -382,15 +382,21 @@ def _jobs() -> sqlite3.Connection:
     con = sqlite3.connect(JOBS_DB, timeout=10)
     con.execute(
         "CREATE TABLE IF NOT EXISTS jobs (id TEXT PRIMARY KEY, rom_id INTEGER, user_id INTEGER, status TEXT, total INTEGER, done INTEGER,"
-        " current TEXT, message TEXT, code TEXT, sent INTEGER, skipped INTEGER, target TEXT, dest TEXT, started REAL, updated REAL)"
+        " current TEXT, message TEXT, code TEXT, sent INTEGER, skipped INTEGER, target TEXT, dest TEXT, started REAL, updated REAL,"
+        " source TEXT)"
     )
+    try:  # Added after the first release: the library file or folder being sent.
+        con.execute("ALTER TABLE jobs ADD COLUMN source TEXT")
+    except sqlite3.OperationalError:
+        pass
     return con
 
 
-_JOB_FIELDS = ("id", "rom_id", "user_id", "status", "total", "done", "current", "message", "code", "sent", "skipped", "target", "dest", "started", "updated")
+_JOB_FIELDS = (
+    "id", "rom_id", "user_id", "status", "total", "done", "current", "message", "code", "sent", "skipped", "target", "dest",
+    "started", "updated", "source",
+)
 _STALE_SECONDS = 600
-# A send queued after an install waits behind RomM's other background jobs (scans) on the worker.
-_QUEUED_SECONDS = 2 * 3600
 
 
 def job(job_id: str) -> dict[str, Any] | None:
@@ -399,21 +405,18 @@ def job(job_id: str) -> dict[str, Any] | None:
     if not row:
         return None
     out = dict(zip(_JOB_FIELDS, row))
-    # A job whose worker died (RomM restarted mid-transfer) would otherwise read as running forever.
-    idle = time.time() - (out["updated"] or 0)
-    if (out["status"] == "running" and idle > _STALE_SECONDS) or (out["status"] == "queued" and idle > _QUEUED_SECONDS):
+    # A job whose thread died (RomM restarted mid-transfer) would otherwise read as running forever.
+    if out["status"] == "running" and time.time() - (out["updated"] or 0) > _STALE_SECONDS:
         out["status"], out["code"], out["message"] = "failed", "stalled", "The transfer stopped answering. Try sending again."
     return out
 
 
-def running_for(rom_id: int) -> dict[str, Any] | None:
-    """A send of this game that is queued or under way, so a second click doesn't start another."""
+def running_for(source: str) -> dict[str, Any] | None:
+    """A send of this library file that is under way, so a second click doesn't start another."""
     with closing(_jobs()) as con:
-        row = con.execute(
-            "SELECT id FROM jobs WHERE rom_id = ? AND status IN ('running', 'queued') ORDER BY started DESC LIMIT 1", (rom_id,)
-        ).fetchone()
+        row = con.execute("SELECT id FROM jobs WHERE source = ? AND status = 'running' ORDER BY started DESC LIMIT 1", (source,)).fetchone()
     found = job(row[0]) if row else None
-    return found if found and found["status"] in ("running", "queued") else None
+    return found if found and found["status"] == "running" else None
 
 
 def _update(job_id: str, **fields: Any) -> None:
@@ -422,27 +425,24 @@ def _update(job_id: str, **fields: Any) -> None:
         con.execute(f"UPDATE jobs SET {', '.join(f'{k} = ?' for k in fields)} WHERE id = ?", (*fields.values(), job_id))
 
 
-def mark_failed(job_id: str, exc: FtpError) -> None:
-    _update(job_id, status="failed", message=str(exc), code=exc.code)
-
-
 def create_job(
     s: dict[str, Any] | None,
     uploads: list[Upload],
     *,
-    rom_id: int,
+    rom_id: int | None,
     user_id: int,
     dest: str,
+    source: str = "",
     status: str = "running",
     error: FtpError | None = None,
 ) -> str:
-    """Record a send. `queued` waits for RomM's worker; `failed` (with `error`) reports a send that couldn't start."""
+    """Record a send. `failed` (with `error`) records a send that couldn't start, so the page can say why."""
     job_id = uuid.uuid4().hex
     now = time.time()
     with closing(_jobs()) as con, con:
         con.execute(
-            "INSERT INTO jobs (id, rom_id, user_id, status, total, done, current, message, code, sent, skipped, target, dest, started, updated)"
-            " VALUES (?, ?, ?, ?, ?, 0, NULL, ?, ?, 0, 0, ?, ?, ?, ?)",
+            "INSERT INTO jobs (id, rom_id, user_id, status, total, done, current, message, code, sent, skipped, target, dest, started, updated,"
+            " source) VALUES (?, ?, ?, ?, ?, 0, NULL, ?, ?, 0, 0, ?, ?, ?, ?, ?)",
             (
                 job_id,
                 rom_id,
@@ -455,6 +455,7 @@ def create_job(
                 dest,
                 now,
                 now,
+                source,
             ),
         )
     return job_id
@@ -463,7 +464,6 @@ def create_job(
 def run_job(job_id: str, s: dict[str, Any], uploads: list[Upload], factory: Callable[..., ftplib.FTP] | None = None) -> dict[str, Any]:
     """Do the transfer for a recorded job, keeping its progress up to date. Never raises."""
     total = sum(u.size for u in uploads)
-    _update(job_id, status="running", total=total)
     last = [0.0]
 
     def progress(done: int, current: str) -> None:
@@ -485,14 +485,19 @@ def start(
     s: dict[str, Any],
     uploads: list[Upload],
     *,
-    rom_id: int,
+    rom_id: int | None,
     user_id: int,
     dest: str,
+    source: str = "",
     factory: Callable[..., ftplib.FTP] | None = None,
     background: bool = True,
 ) -> dict[str, Any]:
-    """Record a job and run the transfer in a thread. Poll `job(id)` for progress."""
-    job_id = create_job(s, uploads, rom_id=rom_id, user_id=user_id, dest=dest)
+    """Record a job and run the transfer in a thread (RomM's web process lives on). Poll `job(id)` for progress.
+    A send of the same file already under way is returned instead of starting another."""
+    running = running_for(source) if source else None
+    if running:
+        return running
+    job_id = create_job(s, uploads, rom_id=rom_id, user_id=user_id, dest=dest, source=source)
     if background:
         threading.Thread(target=run_job, args=(job_id, s, uploads, factory), name=f"romstop-ftp-{job_id[:8]}", daemon=True).start()
         return job(job_id) or {}

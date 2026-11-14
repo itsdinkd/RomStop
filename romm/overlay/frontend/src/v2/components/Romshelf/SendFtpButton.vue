@@ -16,13 +16,15 @@ import { formatBytes, useFtpStatus } from "@/v2/components/Romshelf/ftp";
 
 const props = withDefaults(
   defineProps<{
-    romId: number;
+    /** An install (works before RomM's scan has added it), or a library game. */
+    installId?: string | null;
+    romId?: number | null;
     title?: string;
     size?: "small" | "default";
     /** A send RomM's server started by itself (after an install); shown while it is still going. */
     jobId?: string | null;
   }>(),
-  { title: "", size: "default", jobId: null },
+  { title: "", size: "default", jobId: null, installId: null, romId: null },
 );
 
 const { t } = useI18n();
@@ -34,12 +36,7 @@ const starting = ref(false);
 let timer: ReturnType<typeof setTimeout> | null = null;
 
 const visible = computed(() => ftp.value.enabled && canSend.value);
-const busy = computed(
-  () =>
-    starting.value ||
-    job.value?.status === "running" ||
-    job.value?.status === "queued",
-);
+const busy = computed(() => starting.value || job.value?.status === "running");
 const progress = computed(() => {
   const j = job.value;
   if (!j || j.status !== "running" || !j.total) return "";
@@ -54,7 +51,10 @@ async function send() {
   if (busy.value || !visible.value) return;
   starting.value = true;
   try {
-    const { data } = await romshelfApi.sendWithFtp(props.romId);
+    const { data } = await romshelfApi.sendWithFtp({
+      installId: props.installId,
+      romId: props.romId,
+    });
     job.value = data;
     follow(data);
   } catch (err) {
@@ -65,7 +65,7 @@ async function send() {
 }
 
 function follow(j: FtpJob) {
-  if (j.status === "running" || j.status === "queued") {
+  if (j.status === "running") {
     timer = setTimeout(() => void poll(j.id), 1000);
     return;
   }
@@ -106,8 +106,7 @@ async function track(id: string, quietIfOver = false) {
   if (!/^[0-9a-f]{32}$/.test(id) || job.value?.id === id) return;
   try {
     const { data } = await romshelfApi.getFtpJob(id);
-    if (quietIfOver && data.status !== "running" && data.status !== "queued")
-      return;
+    if (quietIfOver && data.status !== "running") return;
     job.value = data;
     follow(data);
   } catch {
@@ -145,16 +144,9 @@ defineExpose({ send, track, visible });
     >
       {{ t("romshelf.ftp-send") }}
     </RBtn>
-    <span
-      v-if="job?.status === 'running' || job?.status === 'queued'"
-      class="r-v2-rs-ftp__progress"
-    >
+    <span v-if="job?.status === 'running'" class="r-v2-rs-ftp__progress">
       <RSpinner :size="14" />
-      {{
-        job.status === "queued"
-          ? t("romshelf.ftp-queued", { target: job.target })
-          : progress || t("romshelf.ftp-sending", { target: job.target })
-      }}
+      {{ progress || t("romshelf.ftp-sending", { target: job.target }) }}
     </span>
   </span>
 </template>

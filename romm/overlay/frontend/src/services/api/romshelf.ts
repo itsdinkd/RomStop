@@ -120,7 +120,7 @@ export interface RomshelfInstall {
   base_rom_id: number;
   installed_at: string;
   checksum_validated: boolean;
-  /** The Send with FTP job started when the install reached the library (ask for it with sendFtp). */
+  /** The install's latest Send with FTP job (Install + Send with FTP starts one right after patching). */
   ftp_job?: string | null;
 }
 
@@ -249,7 +249,7 @@ export interface RomshelfInstallInput {
   replace?: boolean;
   /** Save the hack in a "Hacks" folder inside the platform folder. */
   hacksFolder?: boolean;
-  /** Send with FTP once the install is in the library; RomM's server does it, so the page can be closed. */
+  /** Send with FTP as soon as the patched file is written; independent of RomM's scan. */
   sendFtp?: boolean;
   patchFile?: File | null;
 }
@@ -410,7 +410,7 @@ export interface FtpTestResult {
 export interface FtpJob {
   id: string;
   rom_id: number;
-  status: "queued" | "running" | "done" | "failed";
+  status: "running" | "done" | "failed";
   total: number;
   done: number;
   current: string | null;
@@ -440,8 +440,15 @@ async function testFtp(input: FtpSettingsInput) {
   return api.post<FtpTestResult>("/romshelf/ftp/test", input);
 }
 
-async function sendWithFtp(romId: number) {
-  return api.post<FtpJob>("/romshelf/ftp/send", { rom_id: romId });
+/** Send an install (also before RomM's scan has added it) or a library game. */
+async function sendWithFtp(target: {
+  installId?: string | null;
+  romId?: number | null;
+}) {
+  return api.post<FtpJob>("/romshelf/ftp/send", {
+    install_id: target.installId ?? undefined,
+    rom_id: target.romId ?? undefined,
+  });
 }
 
 async function getFtpJob(jobId: string) {

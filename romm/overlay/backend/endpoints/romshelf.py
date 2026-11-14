@@ -18,7 +18,7 @@ from decorators.auth import protected_route
 from endpoints.sockets.scan import ScanPayload, queue_scan
 from handler.auth.constants import Scope
 from handler.auth.dependencies import assert_admin, get_permissions
-from handler.database import db_rom_handler, db_save_handler, db_state_handler
+from handler.database import db_platform_handler, db_rom_handler, db_save_handler, db_state_handler
 from handler.database.base_handler import sync_session
 from config.config_manager import ROMSTOP_HACKS_FOLDER
 from handler.filesystem import fs_asset_handler
@@ -396,7 +396,7 @@ async def install_hack(
     archive_member: Annotated[str | None, Form(description="File inside a ZIP ROM to patch.")] = None,
     replace: Annotated[bool, Form()] = False,
     hacks_folder: Annotated[bool, Form(description='Save the hack in a "Hacks" folder inside the platform folder.')] = False,
-    send_ftp: Annotated[bool, Form(description="Send with FTP once the install is in the library.")] = False,
+    send_ftp: Annotated[bool, Form(description="Send with FTP as soon as the patched file is written.")] = False,
     patch_file: Annotated[UploadFile | None, File(description="The patch or its archive, when the site needs a browser download.")] = None,
 ) -> dict[str, Any]:
     """Download the hack's patch, apply it to one of this ROM's files and add the result to the library as a new ROM.
@@ -454,7 +454,6 @@ async def install_hack(
             archive_member=archive_member,
             replace=replace,
             hacks_folder=hacks_folder,
-            send_ftp=send_ftp and romshelf_ftp.status()["enabled"],
         )
     except (PatchSourceError, romshelf_installs.InstallError) as exc:
         raise _error(exc) from exc
@@ -466,6 +465,7 @@ async def install_hack(
     finally:
         shutil.rmtree(work, ignore_errors=True)
 
+    record = await _send_after_install(record, send_ftp, request.user.id)
     await _scan_then_finalize(request, base_rom.platform_id, record)
     _count_download(hack_id)
     return {**_install_json(record), "needed": needed_rom_label(hack, base), "match": m.level.value}
@@ -488,15 +488,28 @@ async def _install_mod(request: Request, hack: dict[str, Any], chosen: dict[str,
             user_id=request.user.id,
             replace=replace,
             hacks_folder=hacks_folder,
-            send_ftp=send_ftp and romshelf_ftp.status()["enabled"],
         )
     except (PatchSourceError, romshelf_installs.InstallError) as exc:
         raise _error(exc) from exc
     finally:
         shutil.rmtree(work, ignore_errors=True)
+    record = await _send_after_install(record, send_ftp, request.user.id)
     await _scan_then_finalize(request, base_rom.platform_id, record)
     _count_download(hack["id"])
     return {**_install_json(record), "needed": needed_rom_label(hack), "match": m.level.value}
+
+
+async def _send_after_install(record: dict[str, Any], send_ftp: bool, user_id: int) -> dict[str, Any]:
+    """Install + Send with FTP: send the patched file now, without waiting for RomM's scan. The two are independent:
+    a send that can't start is recorded with its reason and never fails the install."""
+    if not send_ftp or not romshelf_ftp.status()["enabled"]:
+        return record
+    try:
+        job_id = await asyncio.to_thread(romshelf_ftp_send.send_install_or_record_failure, record, user_id)
+    except Exception as exc:
+        log.warning(f"RomStop: could not start sending {record['fs_name']} with FTP: {exc}")
+        return record
+    return romshelf_installs.set_ftp_job(record["id"], job_id) or {**record, "ftp_job": job_id}
 
 
 async def _scan_then_finalize(request: Request, platform_id: int, record: dict[str, Any]) -> None:
@@ -563,15 +576,29 @@ async def test_ftp(request: Request, payload: Annotated[dict[str, Any] | None, B
 
 
 @protected_route(router.post, "/ftp/send", [Scope.ROMS_WRITE])
-async def send_ftp(request: Request, rom_id: Annotated[int, Body(embed=True, ge=1)]) -> dict[str, Any]:
-    """Send a library game (an installed hack, or any ROM) to the FTP target. Returns a job to poll."""
-    rom = db_rom_handler.get_rom(rom_id)
-    if not rom or not get_permissions(request).can_see_rom(rom):
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"ROM {rom_id} not found")
+async def send_with_ftp(request: Request, payload: Annotated[dict[str, Any], Body()]) -> dict[str, Any]:
+    """Send a library game (`rom_id`) or an installed hack (`install_id`, also before RomM's scan has added it)
+    to the FTP target. Returns a job to poll."""
     try:
-        return await asyncio.to_thread(romshelf_ftp_send.send_now, rom, request.user.id)
+        if payload.get("install_id"):
+            record = romshelf_installs.get_record(str(payload["install_id"]))
+            if not record or not romshelf_installs.library_path_exists(record):
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Install not found")
+            if not record.get("platform_fs_slug"):  # installs made before Send with FTP
+                platform = db_platform_handler.get_platform(record["platform_id"])
+                record = {**record, "platform_fs_slug": platform.fs_slug if platform else ""}
+            found = await asyncio.to_thread(romshelf_ftp_send.send_install, record, request.user.id)
+            romshelf_installs.set_ftp_job(record["id"], found["id"])
+            return found
+        rom_id = int(payload.get("rom_id") or 0)
+        rom = db_rom_handler.get_rom(rom_id) if rom_id > 0 else None
+        if not rom or not get_permissions(request).can_see_rom(rom):
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"ROM {rom_id} not found")
+        return await asyncio.to_thread(romshelf_ftp_send.send_rom, rom, request.user.id)
     except romshelf_ftp.FtpError as exc:
         raise _ftp_error(exc) from exc
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Bad send request: {exc}") from None
 
 
 @protected_route(router.get, "/ftp/jobs/{job_id}", [Scope.ROMS_READ])

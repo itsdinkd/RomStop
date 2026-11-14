@@ -257,20 +257,21 @@ class TransferTests(unittest.TestCase):
         server = FakeFtp()
         s = self.settings()
         uploads = self.mod.plan(self.rom, "/content/snes")
-        job = self.mod.start(s, uploads, rom_id=7, user_id=1, dest="/content/snes", factory=server, background=False)
+        job = self.mod.start(s, uploads, rom_id=7, user_id=1, dest="/content/snes", source="a", factory=server, background=False)
         self.assertEqual(job["status"], "done")
         self.assertEqual((job["done"], job["total"], job["sent"]), (self.rom.stat().st_size, self.rom.stat().st_size, 1))
         self.assertEqual(job["target"], "ps5")
-        self.assertIsNone(self.mod.running_for(7))
+        self.assertIsNone(self.mod.running_for("a"))
 
         failed = self.mod.start(s, uploads, rom_id=8, user_id=1, dest="/x", factory=FakeFtp(fail_stor=True), background=False)
         self.assertEqual((failed["status"], failed["code"]), ("failed", "refused"))
 
-    def test_a_queued_job_waits_then_runs(self):
+    def test_a_second_click_returns_the_send_under_way(self):
         s = self.settings()
         uploads = self.mod.plan(self.rom, "/content/snes")
-        job_id = self.mod.create_job(s, uploads, rom_id=10, user_id=1, dest="/content/snes", status="queued")
-        self.assertEqual(self.mod.running_for(10)["id"], job_id)  # a second click returns this send
+        job_id = self.mod.create_job(s, uploads, rom_id=None, user_id=1, dest="/content/snes", source=str(self.rom))
+        again = self.mod.start(s, uploads, rom_id=10, user_id=1, dest="/content/snes", source=str(self.rom), factory=FakeFtp(), background=False)
+        self.assertEqual(again["id"], job_id)
         out = self.mod.run_job(job_id, s, uploads, factory=FakeFtp())
         self.assertEqual((out["status"], out["sent"]), ("done", 1))
 
@@ -278,21 +279,32 @@ class TransferTests(unittest.TestCase):
         err = self.mod.FtpError("Send with FTP is off.", "not_configured")
         job_id = self.mod.create_job(None, [], rom_id=11, user_id=1, dest="", status="failed", error=err)
         self.assertEqual((self.mod.job(job_id)["code"], self.mod.job(job_id)["message"]), ("not_configured", "Send with FTP is off."))
-        self.assertIsNone(self.mod.running_for(11))
 
     def test_a_job_left_running_by_a_restart_reads_as_failed(self):
-        job = self.mod.start(self.settings(), [], rom_id=9, user_id=1, dest="/x", factory=FakeFtp(), background=False)
+        job = self.mod.start(self.settings(), [], rom_id=9, user_id=1, dest="/x", source="b", factory=FakeFtp(), background=False)
         self.mod._update(job["id"], status="running")
         with mock.patch.object(self.mod.time, "time", return_value=job["updated"] + 3600):
             self.assertEqual(self.mod.job(job["id"])["code"], "stalled")
-            self.assertIsNone(self.mod.running_for(9))
+            self.assertIsNone(self.mod.running_for("b"))
+
+    def test_job_files_from_the_first_release_get_the_new_column(self):
+        import sqlite3
+
+        con = sqlite3.connect(self.tmp / "ftp.sqlite")
+        con.execute(
+            "CREATE TABLE jobs (id TEXT PRIMARY KEY, rom_id INTEGER, user_id INTEGER, status TEXT, total INTEGER, done INTEGER,"
+            " current TEXT, message TEXT, code TEXT, sent INTEGER, skipped INTEGER, target TEXT, dest TEXT, started REAL, updated REAL)"
+        )
+        con.close()
+        job = self.mod.start(self.settings(), [], rom_id=1, user_id=1, dest="/x", source="c", factory=FakeFtp(), background=False)
+        self.assertEqual((job["status"], job["source"]), ("done", "c"))
 
 
 _SEND_PATH = Path(__file__).resolve().parents[1] / "overlay/backend/handler/romshelf/ftp_send.py"
 
 
-class QueueTests(unittest.TestCase):
-    """ftp_send: the send after an install goes to RomM's worker queue."""
+class SendTests(unittest.TestCase):
+    """ftp_send: sending works on the library file, so an install is sent before RomM's scan adds it."""
 
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp())
@@ -300,30 +312,13 @@ class QueueTests(unittest.TestCase):
         (self.library / "roms/snes/Hacks").mkdir(parents=True)
         (self.library / "roms/snes/Hacks/Hack [RomStop].sfc").write_bytes(b"rom")
         self.ftp = _load(self.tmp / "resources")
-        self.rom = types.SimpleNamespace(
-            id=5, fs_path="roms/snes/Hacks", fs_name="Hack [RomStop].sfc", full_path="roms/snes/Hacks/Hack [RomStop].sfc",
-            platform=types.SimpleNamespace(fs_slug="snes"),
-        )
-        self.enqueued = []
+        self.server = FakeFtp(dirs=("/content",))
         library = self.library
-
-        class Queue:
-            def __init__(self, fail=False):
-                self.fail = fail
-
-            def enqueue(q, fn, *args, **kw):
-                if q.fail:
-                    raise ConnectionError("redis down")
-                self.enqueued.append((fn, args, kw))
-
-        self.queue = Queue()
         stubs = {
             "config": types.SimpleNamespace(ROMM_AUTH_SECRET_KEY="k"),
             "config.config_manager": types.SimpleNamespace(ROMSTOP_HACKS_FOLDER="Hacks"),
             "handler": types.ModuleType("handler"),
-            "handler.database": types.SimpleNamespace(db_rom_handler=types.SimpleNamespace(get_rom=lambda i: self.rom if i == 5 else None)),
             "handler.filesystem": types.SimpleNamespace(fs_rom_handler=types.SimpleNamespace(validate_path=lambda p: library / p)),
-            "handler.redis_handler": types.SimpleNamespace(low_prio_queue=self.queue),
             "logger.logger": types.SimpleNamespace(log=mock.Mock()),
             "handler.romshelf": types.ModuleType("handler.romshelf"),
             "handler.romshelf.ftp": self.ftp,
@@ -333,39 +328,34 @@ class QueueTests(unittest.TestCase):
             spec = importlib.util.spec_from_file_location("handler.romshelf.ftp_send", _SEND_PATH)
             self.mod = importlib.util.module_from_spec(spec)
             spec.loader.exec_module(self.mod)
+        # Run transfers inline against the fake server.
+        real_start = self.ftp.start
+        self.ftp.start = lambda *a, **kw: real_start(*a, **{**kw, "factory": self.server, "background": False})
+        self.record = {"id": "r1", "fs_path": "roms/snes/Hacks", "fs_name": "Hack [RomStop].sfc", "platform_fs_slug": "snes", "rom_id": None}
 
-    def test_queue_records_a_queued_send_for_the_worker(self):
-        self.ftp.save({"enabled": True, "host": "ps5", "base_path": "/data/homebrew/PPSA99169/content"})
-        job_id = self.mod.queue(5, 1)
-        job = self.ftp.job(job_id)
-        self.assertEqual((job["status"], job["dest"], job["total"]), ("queued", "/data/homebrew/PPSA99169/content/snes/Hacks", 3))
-        fn, args, kw = self.enqueued[0]
-        self.assertIs(fn, self.mod.run_queued)
-        self.assertEqual(args, (job_id, 5))
-        # Installing twice before the worker gets to it still sends once.
-        self.assertEqual(self.mod.queue(5, 1), job_id)
-        self.assertEqual(len(self.enqueued), 1)
-
-    def test_queue_records_why_it_cannot_send(self):
-        job = self.ftp.job(self.mod.queue(5, 1))  # Send with FTP is off
-        self.assertEqual((job["status"], job["code"]), ("failed", "not_configured"))
-        self.assertEqual(self.enqueued, [])
-        self.assertIsNone(self.mod.queue(99, 1))  # no such ROM
-
-    def test_the_worker_sends_with_the_settings_as_they_are_then(self):
+    def test_an_install_is_sent_before_the_scan(self):
         self.ftp.save({"enabled": True, "host": "ps5", "base_path": "/content"})
-        job_id = self.mod.queue(5, 1)
-        self.ftp.save({"enabled": False})
-        self.mod.run_queued(job_id, 5)
-        self.assertEqual(self.ftp.job(job_id)["code"], "not_configured")
+        job_id = self.mod.send_install_or_record_failure(self.record, 1)
+        job = self.ftp.job(job_id)
+        self.assertEqual((job["status"], job["dest"], job["rom_id"]), ("done", "/content/snes/Hacks", None))
+        self.assertEqual(self.server.files["/content/snes/Hacks/Hack [RomStop].sfc"], b"rom")
 
-        self.ftp.save({"enabled": True})
-        job_id = self.mod.queue(5, 1)
-        server = FakeFtp(dirs=("/content",))
-        with mock.patch.object(self.ftp.ftplib, "FTP", server):
-            self.mod.run_queued(job_id, 5)
-        self.assertEqual(self.ftp.job(job_id)["status"], "done")
-        self.assertEqual(server.files["/content/snes/Hacks/Hack [RomStop].sfc"], b"rom")
+    def test_a_library_game_is_sent_the_same_way(self):
+        self.ftp.save({"enabled": True, "host": "ps5", "base_path": "/content", "folders": {"snes": "SNES"}})
+        rom = types.SimpleNamespace(id=5, fs_path="roms/snes/Hacks", fs_name="Hack [RomStop].sfc", platform=types.SimpleNamespace(fs_slug="snes"))
+        job = self.mod.send_rom(rom, 1)
+        self.assertEqual((job["status"], job["rom_id"]), ("done", 5))
+        self.assertIn("/content/SNES/Hacks/Hack [RomStop].sfc", self.server.files)
+
+    def test_an_install_still_succeeds_when_the_send_cannot_start(self):
+        job = self.ftp.job(self.mod.send_install_or_record_failure(self.record, 1))  # Send with FTP is off
+        self.assertEqual((job["status"], job["code"]), ("failed", "not_configured"))
+        self.ftp.save({"enabled": True, "host": "ps5"})
+        missing = {**self.record, "fs_name": "Gone.sfc"}
+        job = self.ftp.job(self.mod.send_install_or_record_failure(missing, 1))
+        self.assertEqual((job["status"], job["code"]), ("failed", "missing_file"))
+        with self.assertRaises(self.ftp.FtpError):
+            self.mod.send_install(missing, 1)  # the Send button shows the reason instead
 
 
 try:
