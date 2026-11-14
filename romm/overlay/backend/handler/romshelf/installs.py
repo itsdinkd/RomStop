@@ -16,6 +16,7 @@ from typing import Any
 from sqlalchemy import select
 
 from config import LIBRARY_BASE_PATH, ROM_PATCHER_MAX_FILE_SIZE_BYTES
+from config.config_manager import ROMSTOP_HACKS_FOLDER
 from handler.database import db_collection_handler, db_rom_handler
 from handler.database.base_handler import sync_session
 from handler.filesystem import fs_resource_handler, fs_rom_handler
@@ -95,6 +96,26 @@ def _strip_header(rom_path: Path, console: str | None, work: Path) -> tuple[Path
 _KEEP_HEADER = {"nes"}
 
 
+def _games_dir(platform: Any) -> str:
+    try:
+        return fs_rom_handler.get_roms_upload_path(platform.fs_slug)
+    except ValueError as exc:
+        raise InstallError(str(exc)) from exc
+
+
+def _destination(games_dir: str, fs_name: str, hacks_folder: bool) -> tuple[str, Path]:
+    """The folder and path an install is saved to: the platform's games folder, or its "Hacks" folder when asked.
+
+    A copy already in either folder keeps its place, so replacing it never leaves a second copy behind."""
+    hacks_dir = f"{games_dir}/{ROMSTOP_HACKS_FOLDER}"
+    folders = [hacks_dir, games_dir] if hacks_folder else [games_dir, hacks_dir]
+    for folder in folders:
+        path = fs_rom_handler.validate_path(f"{folder}/{fs_name}")
+        if path.exists():
+            return folder, path
+    return folders[0], fs_rom_handler.validate_path(f"{folders[0]}/{fs_name}")
+
+
 async def install(
     *,
     hack: dict[str, Any],
@@ -106,13 +127,11 @@ async def install(
     user_id: int,
     archive_member: str | None,
     replace: bool,
+    hacks_folder: bool = False,
 ) -> dict[str, Any]:
     """Patch `rom_file` with `patch_path` and drop the result where the next scan finds it as a new ROM."""
     platform = base_rom.platform
-    try:
-        dest_dir = fs_rom_handler.get_roms_upload_path(platform.fs_slug)
-    except ValueError as exc:
-        raise InstallError(str(exc)) from exc
+    games_dir = _games_dir(platform)
 
     src = fs_rom_handler.validate_path(rom_file.full_path)
     version_label = (version or {}).get("version") or hack.get("version")
@@ -130,7 +149,7 @@ async def install(
                 raise InstallError(str(exc), "archive") from exc
         ext = rom_path.suffix or Path(rom_file.file_name).suffix
         fs_name = output_file_name(hack, version_label, list(base_rom.regions or []), ext)
-        dest = fs_rom_handler.validate_path(f"{dest_dir}/{fs_name}")
+        dest_dir, dest = _destination(games_dir, fs_name, hacks_folder)
         if dest.exists() and not replace:
             raise InstallError(f"{fs_name} is already in your library.", "already_installed", 409)
 
@@ -178,6 +197,9 @@ def _add_record(
         "checksum_validated": validated,
         "status": "pending",
         "rom_id": None,
+        # Send with FTP works on the file, before the scan: it needs the platform's folder name, and keeps its job.
+        "platform_fs_slug": platform.fs_slug,
+        "ftp_job": None,
         # What finalize writes onto the new ROM; kept here so the worker needs no index.
         "metadata": _metadata_for(hack, version, base_rom),
     }
@@ -196,17 +218,14 @@ async def install_mod(
     package: Path,
     user_id: int,
     replace: bool,
+    hacks_folder: bool = False,
 ) -> dict[str, Any]:
     """Install a Wii Riivolution or Vita rePatch mod onto `rom_file` as a new library entry.
 
     Wii: a folder "<name>.json" next to the platform's other games holding the Dolphin launcher "<name>.json" for
     the user's own disc image and the mod's files; the disc itself is left as it is. Vita: a new .vpk with the mod laid over the dump."""
     method = (hack.get("install") or {}).get("method")
-    platform = base_rom.platform
-    try:
-        dest_dir = fs_rom_handler.get_roms_upload_path(platform.fs_slug)
-    except ValueError as exc:
-        raise InstallError(str(exc)) from exc
+    games_dir = _games_dir(base_rom.platform)
     src = fs_rom_handler.validate_path(rom_file.full_path)
     version_label = (version or {}).get("version") or hack.get("version")
     wii = method == "riivolution"
@@ -217,7 +236,7 @@ async def install_mod(
         )
     # Wii: a folder named "<name>.json" holding "<name>.json", so ES-DE lists it as one game.
     fs_name = output_file_name(hack, version_label, list(base_rom.regions or []), ".json" if wii else ".vpk")
-    dest = fs_rom_handler.validate_path(f"{dest_dir}/{fs_name}")
+    dest_dir, dest = _destination(games_dir, fs_name, hacks_folder)
     if dest.exists():
         if not replace:
             raise InstallError(f"{fs_name} is already in your library.", "already_installed", 409)
@@ -353,6 +372,21 @@ async def finalize(record_id: str) -> dict[str, Any] | None:
                 record = r
     log.info(f"RomStop: {record['fs_name']} is ROM {rom.id}")
     return record
+
+
+def get_record(record_id: str) -> dict[str, Any] | None:
+    return next((r for r in all_records() if r["id"] == record_id), None)
+
+
+def set_ftp_job(record_id: str, job_id: str) -> dict[str, Any] | None:
+    """Remember the install's latest Send with FTP, so the page can show it after a reload."""
+    found = None
+    with _locked() as records:
+        for r in records:
+            if r["id"] == record_id:
+                r["ftp_job"] = job_id
+                found = r
+    return found
 
 
 async def finalize_pending() -> None:

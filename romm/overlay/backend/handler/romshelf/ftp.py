@@ -1,0 +1,724 @@
+"""Send with FTP: copy a game from the library to another device's FTP server.
+
+Meant for consoles and handhelds that run their own FTP server, such as a jailbroken PS5's FTP payload next to
+RetroArch: RomM patches the hack, then pushes the finished ROM to `<base path>/<console folder>/[Hacks/]<file>`.
+Nothing here is device-specific; presets (PRESETS) only fill in the settings form.
+
+Settings live in RomM resources `romshelf/ftp.json` (owner read/write only), set by an admin: one or more targets
+(a PS5, a handheld...), each with its own server, folders and saves settings, and a default. Each password is
+encrypted with a key derived from ROMM_AUTH_SECRET_KEY and is never sent back to the browser. Transfers run in a
+background thread; their progress is kept in `romshelf/ftp.sqlite` so any RomM worker can report it."""
+
+import base64
+import ftplib
+import hashlib
+import json
+import os
+import posixpath
+import re
+import sqlite3
+import threading
+import time
+import uuid
+from collections.abc import Callable, Iterator
+from contextlib import closing
+from dataclasses import dataclass
+from pathlib import Path, PurePosixPath
+from typing import Any
+
+from cryptography.fernet import Fernet, InvalidToken
+
+from config import ROMM_AUTH_SECRET_KEY
+
+from .index import ROMSHELF_DIR
+
+SETTINGS_FILE = ROMSHELF_DIR / "ftp.json"
+JOBS_DB = ROMSHELF_DIR / "ftp.sqlite"
+
+HACKS_MODES = ("match", "always", "never")
+EXISTING_MODES = ("replace", "skip")
+# RetroArch's save/state folder layouts: flat, "Sort Saves into Folders by Core Name" (core), "...by Content
+# Directory" (content: the folder the game sits in on the device), or both (core_content: <core>/<content dir>).
+SAVE_LAYOUTS = ("flat", "core", "content", "core_content")
+
+DEFAULTS: dict[str, Any] = {
+    "enabled": False,
+    "name": "",
+    "preset": None,
+    "host": "",
+    "port": 21,
+    "username": "",
+    "tls": False,
+    "passive": True,
+    "base_path": "/",
+    # RomM platform folder (fs_slug) -> folder on the device. A platform not listed uses its RomM folder name.
+    "folders": {},
+    # "match": a game in RomM's Hacks folder goes to the device's Hacks folder too; "always" / "never".
+    "hacks": "match",
+    "hacks_folder": "Hacks",
+    "existing": "replace",
+    "timeout": 30,
+    # Saves and save states: RetroArch's saves and states folders on the device ("" = not set up).
+    "saves_path": "",
+    "states_path": "",
+    "saves_layout": "flat",
+}
+
+# Starting points for the settings form, not hardcoded behavior: every value can be changed after picking one.
+PRESETS: dict[str, dict[str, Any]] = {
+    "ps5-retroarch": {
+        "label": "PS5 (RetroArch)",
+        "description": (
+            "A jailbroken PS5 running an FTP server payload, with RetroArch reading games from its content folder, "
+            "one folder per console (content/snes, content/nes...). The base path is RetroArch's content folder, "
+            "/data/homebrew/<RetroArch's title id>/content (PPSA99169 on one tested install). The etaHEN FTP server "
+            "listens on port 1337; the standalone ftpsrv payload uses 2121. Test connection lists the folders it finds."
+        ),
+        "settings": {
+            "name": "PS5",
+            "port": 1337,
+            "username": "",
+            "tls": False,
+            "passive": True,
+            "base_path": "/data/homebrew/PPSA99169/content",
+            "folders": {},
+            "hacks": "match",
+            "hacks_folder": "Hacks",
+            "existing": "replace",
+            "saves_path": "/data/homebrew/PPSA99169/saves",
+            "states_path": "/data/homebrew/PPSA99169/states",
+            "saves_layout": "flat",
+        },
+    },
+    "retroarch": {
+        "label": "RetroArch device (generic)",
+        "description": "Any device with an FTP server and a RetroArch content folder with one folder per console.",
+        "settings": {"port": 21, "base_path": "/content", "folders": {}, "hacks": "match"},
+    },
+}
+
+
+class FtpError(Exception):
+    def __init__(self, message: str, code: str = "ftp_error", status: int = 400):
+        super().__init__(message)
+        self.code = code
+        self.status = status
+
+
+# ------------------------------------------------------------------ settings
+
+
+def _fernet() -> Fernet:
+    digest = hashlib.sha256(f"romstop-ftp:{ROMM_AUTH_SECRET_KEY}".encode()).digest()
+    return Fernet(base64.urlsafe_b64encode(digest))
+
+
+def _encrypt(password: str) -> str:
+    return _fernet().encrypt(password.encode()).decode()
+
+
+def _decrypt(token: str | None) -> str:
+    if not token:
+        return ""
+    try:
+        return _fernet().decrypt(token.encode()).decode()
+    except InvalidToken:
+        # ROMM_AUTH_SECRET_KEY changed since the password was saved.
+        raise FtpError("The saved FTP password can't be read any more. Enter it again in the FTP settings.", "password_unreadable") from None
+
+
+def _clean_folder(value: Any, field: str) -> str:
+    text = str(value or "").strip().replace("\\", "/").strip("/")
+    if any(part in ("..", ".") for part in text.split("/") if part):
+        raise FtpError(f"{field} can't contain '.' or '..'.", "bad_settings")
+    return "/".join(p for p in text.split("/") if p)
+
+
+def new_id() -> str:
+    return uuid.uuid4().hex[:8]
+
+
+def _clean_id(value: Any) -> str:
+    text = str(value or "")
+    return text if re.fullmatch(r"[A-Za-z0-9_-]{1,32}", text) else ""
+
+
+def _validate(raw: dict[str, Any]) -> dict[str, Any]:
+    s = {k: raw.get(k, v) for k, v in DEFAULTS.items()}
+    s["id"] = _clean_id(raw.get("id")) or new_id()
+    s["enabled"] = bool(s["enabled"])
+    s["name"] = str(s["name"] or "").strip()[:60]
+    s["preset"] = s["preset"] if s["preset"] in PRESETS else None
+    s["host"] = str(s["host"] or "").strip()
+    if any(c in s["host"] for c in "/@ \t"):
+        raise FtpError("Enter the host as a name or IP address, without ftp:// or a path.", "bad_settings")
+    try:
+        s["port"] = int(s["port"])
+        s["timeout"] = int(s["timeout"])
+    except (TypeError, ValueError):
+        raise FtpError("Port and timeout must be numbers.", "bad_settings") from None
+    if not 1 <= s["port"] <= 65535:
+        raise FtpError("Port must be between 1 and 65535.", "bad_settings")
+    s["timeout"] = min(max(s["timeout"], 5), 300)
+    s["username"] = str(s["username"] or "").strip()
+    s["tls"] = bool(s["tls"])
+    s["passive"] = bool(s["passive"])
+    s["base_path"] = "/" + _clean_folder(s["base_path"], "Base path")
+    if not isinstance(s["folders"], dict):
+        raise FtpError("Folders must map a platform to a folder.", "bad_settings")
+    s["folders"] = {
+        str(k).strip(): _clean_folder(v, f"Folder for {k}") for k, v in s["folders"].items() if str(k).strip() and str(v or "").strip()
+    }
+    if s["hacks"] not in HACKS_MODES:
+        raise FtpError("Hacks folder must be match, always or never.", "bad_settings")
+    s["hacks_folder"] = _clean_folder(s["hacks_folder"], "Hacks folder") or "Hacks"
+    for key, label in (("saves_path", "Saves folder"), ("states_path", "Save states folder")):
+        folder = _clean_folder(s[key], label)
+        s[key] = "/" + folder if folder else ""
+    if s["saves_layout"] not in SAVE_LAYOUTS:
+        raise FtpError("Save folder layout must be flat, core, content or core_content.", "bad_settings")
+    if s["existing"] not in EXISTING_MODES:
+        raise FtpError("Existing files must be replaced or skipped.", "bad_settings")
+    if s["enabled"] and not s["host"]:
+        raise FtpError("Enter the FTP server's host to turn Send with FTP on.", "bad_settings")
+    return s
+
+
+# The settings file holds several targets (a PS5, a handheld...), each with its own server, folders and saves
+# settings, plus which one is the default and whether Send with FTP is on at all:
+#   {"version": 2, "enabled": bool, "default": "<id>", "targets": [{"id": ..., <DEFAULTS keys>, "password_enc": ...}]}
+# A file from before several targets (one target's keys at the top level) reads as that one target.
+# Every target dict handed to the rest of this module carries the global "enabled" and its own "id".
+
+
+def _read_raw() -> dict[str, Any]:
+    try:
+        raw = json.loads(SETTINGS_FILE.read_text())
+    except (OSError, ValueError):
+        return {}
+    return raw if isinstance(raw, dict) else {}
+
+
+def load_all() -> dict[str, Any]:
+    """Every saved target (with its encrypted password under `password_enc`), the default's id, and the switch."""
+    raw = _read_raw()
+    if "targets" not in raw:  # the single-target file from the first release
+        raw = {"enabled": raw.get("enabled", False), "default": "", "targets": [{**raw, "id": raw.get("id") or "main"}] if raw.get("host") else []}
+    enabled = bool(raw.get("enabled"))
+    targets = []
+    seen: set[str] = set()
+    for t in raw.get("targets") or []:
+        if not isinstance(t, dict):
+            continue
+        try:
+            s = _validate({**t, "enabled": False})
+        except FtpError:
+            continue
+        if s["id"] in seen:
+            s["id"] = new_id()
+        seen.add(s["id"])
+        s["enabled"] = enabled
+        s["password_enc"] = t.get("password_enc") or None
+        targets.append(s)
+    ids = [t["id"] for t in targets]
+    default = raw.get("default") if raw.get("default") in ids else (ids[0] if ids else "")
+    return {"enabled": enabled, "default": default, "targets": targets}
+
+
+def load(target_id: str | None = None) -> dict[str, Any]:
+    """One target's settings (the default one when `target_id` is empty), with the global switch under `enabled`.
+    With no targets saved yet, the blank defaults."""
+    data = load_all()
+    wanted = target_id or data["default"]
+    for t in data["targets"]:
+        if t["id"] == wanted:
+            return dict(t)
+    if target_id:
+        raise FtpError("That FTP target isn't set up any more. Pick another one.", "unknown_target", 404)
+    return {**DEFAULTS, "id": "", "enabled": data["enabled"], "password_enc": None}
+
+
+def _public_target(s: dict[str, Any]) -> dict[str, Any]:
+    out = {k: v for k, v in s.items() if k not in ("password_enc", "enabled")}
+    out["password_set"] = bool(s.get("password_enc"))
+    return out
+
+
+def public(data: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Settings for the admin form: every target but no password, only whether one is saved."""
+    data = data or load_all()
+    return {"enabled": data["enabled"], "default": data["default"], "targets": [_public_target(t) for t in data["targets"]]}
+
+
+def _merge_target(update: dict[str, Any], current: dict[str, Any] | None, enabled: bool) -> dict[str, Any]:
+    base = {k: v for k, v in (current or {}).items() if k not in ("password_enc", "enabled")}
+    s = _validate({**base, **{k: v for k, v in update.items() if k in DEFAULTS or k == "id"}, "enabled": enabled})
+    if update.get("clear_password"):
+        s["password_enc"] = None
+    elif isinstance(update.get("password"), str) and update["password"] != "":
+        s["password_enc"] = _encrypt(update["password"])
+    else:
+        s["password_enc"] = (current or {}).get("password_enc")
+    return s
+
+
+def merged(update: dict[str, Any], current: dict[str, Any] | None = None) -> dict[str, Any]:
+    """One target's `update` laid over its saved settings (the target named by `update["id"]`, else the default).
+    `password` omitted or empty keeps the saved one; `clear_password` removes it. Used to test unsaved changes."""
+    if not current:
+        data = load_all()
+        current = next((t for t in data["targets"] if t["id"] == update.get("id")), None)
+        if current is None and not update.get("id"):
+            current = next((t for t in data["targets"] if t["id"] == data["default"]), None)
+        enabled = data["enabled"]
+    else:
+        enabled = bool(current.get("enabled"))
+    return _merge_target(update, current, bool(update.get("enabled", enabled)))
+
+
+def _write(data: dict[str, Any]) -> None:
+    out = {
+        "version": 2,
+        "enabled": data["enabled"],
+        "default": data["default"],
+        "targets": [{k: v for k, v in t.items() if k != "enabled"} for t in data["targets"]],
+    }
+    ROMSHELF_DIR.mkdir(parents=True, exist_ok=True)
+    tmp = SETTINGS_FILE.with_suffix(".json.tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        json.dump(out, f, indent=2)
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, SETTINGS_FILE)
+
+
+def save(update: dict[str, Any]) -> dict[str, Any]:
+    """Save the settings form: `{enabled, default, targets: [...]}`, where `targets` is the whole list (a target left
+    out is removed; one without an `id` is added) and each keeps its saved password unless it sends a new one.
+    Without `targets`, the update is for one target (`id`, else the default; a new one when none exist yet)."""
+    data = load_all()
+    enabled = bool(update.get("enabled", data["enabled"]))
+    saved = {t["id"]: t for t in data["targets"]}
+    if "targets" in update:
+        if not isinstance(update["targets"], list):
+            raise FtpError("Targets must be a list.", "bad_settings")
+        targets = []
+        for t in update["targets"]:
+            if not isinstance(t, dict):
+                raise FtpError("Each target must be an object.", "bad_settings")
+            targets.append(_merge_target(t, saved.get(_clean_id(t.get("id"))), enabled))
+    else:
+        wanted = _clean_id(update.get("id")) or data["default"]
+        targets = list(data["targets"])
+        index = next((i for i, t in enumerate(targets) if t["id"] == wanted), None)
+        target = _merge_target(update, targets[index] if index is not None else None, enabled)
+        if index is None:
+            targets.append(target)
+        else:
+            targets[index] = target
+    ids = [t["id"] for t in targets]
+    if len(set(ids)) != len(ids):
+        raise FtpError("Two targets have the same id.", "bad_settings")
+    if enabled and not targets:
+        raise FtpError("Add an FTP target to turn Send with FTP on.", "bad_settings")
+    default = update.get("default", data["default"])
+    data = {"enabled": enabled, "default": default if default in ids else (ids[0] if ids else ""), "targets": targets}
+    for t in targets:
+        t["enabled"] = enabled
+    _write(data)
+    return public(data)
+
+
+def target_name(s: dict[str, Any]) -> str:
+    return s.get("name") or (PRESETS.get(s.get("preset") or "", {}).get("label")) or s.get("host") or "FTP"
+
+
+def status() -> dict[str, Any]:
+    """What a user who may send needs to know: whether sending is on, and the targets to pick from (default first)."""
+    data = load_all()
+    ready = [t for t in data["targets"] if t["host"]] if data["enabled"] else []
+    ready.sort(key=lambda t: t["id"] != data["default"])
+    targets = [{"id": t["id"], "name": target_name(t)} for t in ready]
+    return {
+        "enabled": bool(targets),
+        "name": targets[0]["name"] if targets else None,
+        "default": targets[0]["id"] if targets else None,
+        "targets": targets,
+    }
+
+
+# ------------------------------------------------------------------ paths
+
+
+def remote_dir(s: dict[str, Any], platform_fs_slug: str, in_hacks_folder: bool) -> str:
+    """The device folder a game of this platform goes to."""
+    folder = s["folders"].get(platform_fs_slug) or _clean_folder(platform_fs_slug, "Platform folder")
+    if not folder:
+        raise FtpError("This game has no platform folder.", "bad_platform")
+    parts = [s["base_path"], folder]
+    if s["hacks"] == "always" or (s["hacks"] == "match" and in_hacks_folder):
+        parts.append(s["hacks_folder"])
+    return posixpath.normpath(posixpath.join(*parts))
+
+
+@dataclass(frozen=True)
+class Upload:
+    local: Path
+    remote: str
+    size: int
+    # Saves: a file already on the device is renamed to "<name>.bak-<time>" first, never overwritten.
+    backup: bool = False
+
+
+def plan(local_path: Path, dest_dir: str) -> list[Upload]:
+    """A file goes into `dest_dir`; a folder game (multi-disc, a Wii mod folder...) keeps its layout under `dest_dir/<folder>`."""
+    if local_path.is_file():
+        return [Upload(local_path, posixpath.join(dest_dir, local_path.name), local_path.stat().st_size)]
+    if not local_path.is_dir():
+        raise FtpError(f"{local_path.name} is missing from disk.", "missing_file", 404)
+    out = []
+    for path in sorted(local_path.rglob("*")):
+        if path.is_file() and not path.is_symlink():
+            rel = path.relative_to(local_path).as_posix()
+            out.append(Upload(path, posixpath.join(dest_dir, local_path.name, rel), path.stat().st_size))
+    if not out:
+        raise FtpError(f"{local_path.name} is an empty folder.", "missing_file", 404)
+    return out
+
+
+_VERSION_TAG = re.compile(r" \[\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}\]")
+
+
+def device_save_name(asset_file_name: str, rom_stem: str) -> str:
+    """The name RetroArch looks for: the game's file name with the save's ending (".srm", ".state1", ".state.auto").
+    RomM's version tag (" [2026-11-04_02-33-57]") is dropped."""
+    name = _VERSION_TAG.sub("", asset_file_name)
+    if rom_stem and name.lower().startswith(rom_stem.lower()) and len(name) > len(rom_stem):
+        suffix = name[len(rom_stem):]
+    else:
+        suffix = PurePosixPath(name).suffix
+        # ".state.auto" keeps both parts.
+        if suffix == ".auto" and PurePosixPath(PurePosixPath(name).stem).suffix.startswith(".state"):
+            suffix = PurePosixPath(PurePosixPath(name).stem).suffix + suffix
+    return f"{rom_stem}{suffix}" if rom_stem else name
+
+
+def save_dir(s: dict[str, Any], kind: str, core_dir: str | None, content_dir: str | None) -> str | None:
+    """The device folder for a save ("save") or state ("state") under the settings; None while that folder isn't set."""
+    base = s["saves_path"] if kind == "save" else s["states_path"]
+    if not base:
+        return None
+    parts = [base]
+    if s["saves_layout"] in ("core", "core_content") and core_dir:
+        parts.append(_clean_folder(core_dir, "Core folder"))
+    if s["saves_layout"] in ("content", "core_content") and content_dir:
+        parts.append(_clean_folder(content_dir, "Content folder"))
+    return posixpath.normpath(posixpath.join(*[p for p in parts if p]))
+
+
+def clean_remote_dir(path: str) -> str:
+    """A folder typed in by hand: absolute, no '.' or '..'."""
+    folder = _clean_folder(path, "Folder")
+    if not folder:
+        raise FtpError("Enter a folder on the device, such as /data/homebrew/PPSA99169/saves.", "bad_path")
+    return "/" + folder
+
+
+def clean_file_name(name: str) -> str:
+    name = (name or "").strip()
+    if not name or "/" in name or "\\" in name or name in (".", ".."):
+        raise FtpError("Enter a file name without folders.", "bad_name")
+    return name
+
+
+def remote_exists(s: dict[str, Any], path: str, factory: Callable[..., ftplib.FTP] | None = None) -> bool:
+    ftp = connect(s, factory)
+    try:
+        return remote_size(ftp, path) is not None
+    finally:
+        _quit(ftp)
+
+
+# ------------------------------------------------------------------ FTP
+
+
+def connect(s: dict[str, Any], factory: Callable[..., ftplib.FTP] | None = None) -> ftplib.FTP:
+    if not s.get("host"):
+        raise FtpError("Send with FTP isn't set up yet. An admin can set it up under Settings > Send with FTP.", "not_configured")
+    cls = factory or (ftplib.FTP_TLS if s["tls"] else ftplib.FTP)
+    ftp = cls()
+    try:
+        ftp.connect(s["host"], s["port"], timeout=s["timeout"])
+        ftp.login(s["username"] or "anonymous", _decrypt(s.get("password_enc")))
+        if s["tls"] and hasattr(ftp, "prot_p"):
+            ftp.prot_p()
+        ftp.set_pasv(s["passive"])
+    except ftplib.error_perm as exc:
+        _quit(ftp)
+        raise FtpError(f"The FTP server refused the sign-in: {exc}", "login_failed") from exc
+    except (OSError, EOFError, ftplib.Error) as exc:
+        _quit(ftp)
+        raise FtpError(f"Couldn't reach {s['host']}:{s['port']}: {exc}. Is the FTP server running on the device?", "unreachable") from exc
+    return ftp
+
+
+def _quit(ftp: ftplib.FTP) -> None:
+    try:
+        ftp.quit()
+    except Exception:
+        try:
+            ftp.close()
+        except Exception:
+            pass
+
+
+def make_dirs(ftp: ftplib.FTP, path: str) -> None:
+    """mkdir -p on the server. Folders that exist already answer with an error, which is fine."""
+    current = ""
+    for part in [p for p in path.split("/") if p]:
+        current = f"{current}/{part}"
+        try:
+            ftp.mkd(current)
+        except ftplib.error_perm:
+            pass
+
+
+def remote_size(ftp: ftplib.FTP, path: str) -> int | None:
+    try:
+        ftp.voidcmd("TYPE I")
+        size = ftp.size(path)
+        return int(size) if size is not None else None
+    except (ftplib.error_perm, ValueError):
+        return None
+
+
+def list_folders(ftp: ftplib.FTP, path: str) -> list[str]:
+    """Folder names under `path`, best effort (MLSD where the server has it, else NLST)."""
+    try:
+        return sorted(name for name, facts in ftp.mlsd(path, facts=["type"]) if facts.get("type") == "dir")
+    except (ftplib.error_perm, ftplib.error_reply, ftplib.error_proto):
+        pass
+    try:
+        names = ftp.nlst(path)
+    except ftplib.error_perm:
+        return []
+    return sorted({posixpath.basename(n.rstrip("/")) for n in names} - {"", ".", ".."})
+
+
+def test(s: dict[str, Any], factory: Callable[..., ftplib.FTP] | None = None) -> dict[str, Any]:
+    """Sign in, check the base path and list its folders, so the admin can match platforms to them."""
+    ftp = connect(s, factory)
+    try:
+        try:
+            ftp.cwd(s["base_path"])
+        except ftplib.error_perm as exc:
+            raise FtpError(f"Signed in, but {s['base_path']} isn't a folder on the device: {exc}", "bad_base_path") from exc
+        return {"ok": True, "welcome": (ftp.getwelcome() or "")[:200], "folders": list_folders(ftp, s["base_path"])}
+    finally:
+        _quit(ftp)
+
+
+def send(
+    s: dict[str, Any],
+    uploads: list[Upload],
+    progress: Callable[[int, str], None] | None = None,
+    factory: Callable[..., ftplib.FTP] | None = None,
+) -> dict[str, int]:
+    """Upload every file. Returns how many were sent and skipped."""
+    ftp = connect(s, factory)
+    done = 0
+    sent = skipped = 0
+    try:
+        for up in uploads:
+            make_dirs(ftp, posixpath.dirname(up.remote))
+            if up.backup and remote_size(ftp, up.remote) is not None:
+                keep = f"{up.remote}.bak-{time.strftime('%Y%m%d-%H%M%S')}"
+                try:
+                    ftp.rename(up.remote, keep)
+                except ftplib.error_perm as exc:
+                    raise FtpError(f"Couldn't keep a copy of the save already on the device ({exc}), so nothing was sent.", "backup_failed") from exc
+            elif not up.backup and s["existing"] == "skip" and remote_size(ftp, up.remote) is not None:
+                skipped += 1
+                done += up.size
+                if progress:
+                    progress(done, up.remote)
+                continue
+
+            def chunk(block: bytes, _remote: str = up.remote) -> None:
+                nonlocal done
+                done += len(block)
+                if progress:
+                    progress(done, _remote)
+
+            try:
+                with up.local.open("rb") as f:
+                    ftp.storbinary(f"STOR {up.remote}", f, blocksize=256 * 1024, callback=chunk)
+            except ftplib.error_perm as exc:
+                raise FtpError(f"The device refused {up.remote}: {exc}", "refused") from exc
+            sent += 1
+    except (OSError, EOFError, ftplib.error_temp, ftplib.error_reply, ftplib.error_proto) as exc:
+        raise FtpError(f"The transfer stopped: {exc}", "transfer_failed") from exc
+    finally:
+        _quit(ftp)
+    return {"sent": sent, "skipped": skipped}
+
+
+# ------------------------------------------------------------------ jobs
+
+
+def _jobs() -> sqlite3.Connection:
+    ROMSHELF_DIR.mkdir(parents=True, exist_ok=True)
+    con = sqlite3.connect(JOBS_DB, timeout=10)
+    con.execute(
+        "CREATE TABLE IF NOT EXISTS jobs (id TEXT PRIMARY KEY, rom_id INTEGER, user_id INTEGER, status TEXT, total INTEGER, done INTEGER,"
+        " current TEXT, message TEXT, code TEXT, sent INTEGER, skipped INTEGER, target TEXT, dest TEXT, started REAL, updated REAL,"
+        " source TEXT, target_id TEXT)"
+    )
+    con.execute("CREATE TABLE IF NOT EXISTS save_paths (user_id INTEGER, path TEXT, used REAL, PRIMARY KEY (user_id, path))")
+    for column in ("source", "target_id"):  # added after the first release: what is sent, and to which target
+        try:
+            con.execute(f"ALTER TABLE jobs ADD COLUMN {column} TEXT")
+        except sqlite3.OperationalError:
+            pass
+    return con
+
+
+_JOB_FIELDS = (
+    "id", "rom_id", "user_id", "status", "total", "done", "current", "message", "code", "sent", "skipped", "target", "dest",
+    "started", "updated", "source", "target_id",
+)
+_STALE_SECONDS = 600
+
+
+def job(job_id: str) -> dict[str, Any] | None:
+    with closing(_jobs()) as con:
+        row = con.execute(f"SELECT {', '.join(_JOB_FIELDS)} FROM jobs WHERE id = ?", (job_id,)).fetchone()
+    if not row:
+        return None
+    out = dict(zip(_JOB_FIELDS, row))
+    # A job whose thread died (RomM restarted mid-transfer) would otherwise read as running forever.
+    if out["status"] == "running" and time.time() - (out["updated"] or 0) > _STALE_SECONDS:
+        out["status"], out["code"], out["message"] = "failed", "stalled", "The transfer stopped answering. Try sending again."
+    return out
+
+
+def running_for(source: str, target_id: str = "") -> dict[str, Any] | None:
+    """A send of this file to this target that is under way, so a second click doesn't start another."""
+    with closing(_jobs()) as con:
+        row = con.execute(
+            "SELECT id FROM jobs WHERE source = ? AND COALESCE(target_id, '') = ? AND status = 'running' ORDER BY started DESC LIMIT 1",
+            (source, target_id),
+        ).fetchone()
+    found = job(row[0]) if row else None
+    return found if found and found["status"] == "running" else None
+
+
+def _update(job_id: str, **fields: Any) -> None:
+    fields["updated"] = time.time()
+    with closing(_jobs()) as con, con:
+        con.execute(f"UPDATE jobs SET {', '.join(f'{k} = ?' for k in fields)} WHERE id = ?", (*fields.values(), job_id))
+
+
+def remember_path(user_id: int, path: str) -> None:
+    """A folder typed in by hand, offered again next time (newest first)."""
+    with closing(_jobs()) as con, con:
+        con.execute(
+            "INSERT INTO save_paths (user_id, path, used) VALUES (?, ?, ?) ON CONFLICT (user_id, path) DO UPDATE SET used = excluded.used",
+            (user_id, path, time.time()),
+        )
+
+
+def recent_paths(user_id: int, limit: int = 15) -> list[str]:
+    with closing(_jobs()) as con:
+        return [r[0] for r in con.execute("SELECT path FROM save_paths WHERE user_id = ? ORDER BY used DESC LIMIT ?", (user_id, limit))]
+
+
+def forget_path(user_id: int, path: str) -> None:
+    with closing(_jobs()) as con, con:
+        con.execute("DELETE FROM save_paths WHERE user_id = ? AND path = ?", (user_id, path))
+
+
+def create_job(
+    s: dict[str, Any] | None,
+    uploads: list[Upload],
+    *,
+    rom_id: int | None,
+    user_id: int,
+    dest: str,
+    source: str = "",
+    status: str = "running",
+    error: FtpError | None = None,
+) -> str:
+    """Record a send. `failed` (with `error`) records a send that couldn't start, so the page can say why."""
+    job_id = uuid.uuid4().hex
+    now = time.time()
+    with closing(_jobs()) as con, con:
+        con.execute(
+            "INSERT INTO jobs (id, rom_id, user_id, status, total, done, current, message, code, sent, skipped, target, dest, started, updated,"
+            " source, target_id) VALUES (?, ?, ?, ?, ?, 0, NULL, ?, ?, 0, 0, ?, ?, ?, ?, ?, ?)",
+            (
+                job_id,
+                rom_id,
+                user_id,
+                status,
+                sum(u.size for u in uploads),
+                str(error) if error else None,
+                error.code if error else None,
+                target_name(s) if s else "FTP",
+                dest,
+                now,
+                now,
+                source,
+                (s or {}).get("id") or "",
+            ),
+        )
+    return job_id
+
+
+def run_job(job_id: str, s: dict[str, Any], uploads: list[Upload], factory: Callable[..., ftplib.FTP] | None = None) -> dict[str, Any]:
+    """Do the transfer for a recorded job, keeping its progress up to date. Never raises."""
+    total = sum(u.size for u in uploads)
+    last = [0.0]
+
+    def progress(done: int, current: str) -> None:
+        if time.monotonic() - last[0] >= 0.5:
+            last[0] = time.monotonic()
+            _update(job_id, done=done, current=current)
+
+    try:
+        result = send(s, uploads, progress, factory)
+        _update(job_id, status="done", done=total, sent=result["sent"], skipped=result["skipped"], current=None)
+    except FtpError as exc:
+        _update(job_id, status="failed", message=str(exc), code=exc.code)
+    except Exception as exc:  # Anything else still has to end the job, or the page waits forever.
+        _update(job_id, status="failed", message=f"Sending failed: {exc}", code="error")
+    return job(job_id) or {}
+
+
+def start(
+    s: dict[str, Any],
+    uploads: list[Upload],
+    *,
+    rom_id: int | None,
+    user_id: int,
+    dest: str,
+    source: str = "",
+    factory: Callable[..., ftplib.FTP] | None = None,
+    background: bool = True,
+) -> dict[str, Any]:
+    """Record a job and run the transfer in a thread (RomM's web process lives on). Poll `job(id)` for progress.
+    A send of the same file already under way is returned instead of starting another."""
+    running = running_for(source, s.get("id") or "") if source else None
+    if running:
+        return running
+    job_id = create_job(s, uploads, rom_id=rom_id, user_id=user_id, dest=dest, source=source)
+    if background:
+        threading.Thread(target=run_job, args=(job_id, s, uploads, factory), name=f"romstop-ftp-{job_id[:8]}", daemon=True).start()
+        return job(job_id) or {}
+    return run_job(job_id, s, uploads, factory)
+
+
+def iter_presets() -> Iterator[dict[str, Any]]:
+    for key, p in PRESETS.items():
+        yield {"id": key, "label": p["label"], "description": p["description"], "settings": p["settings"]}
+

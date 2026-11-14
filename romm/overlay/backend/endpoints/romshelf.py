@@ -17,12 +17,16 @@ from sqlalchemy.orm import selectinload
 from decorators.auth import protected_route
 from endpoints.sockets.scan import ScanPayload, queue_scan
 from handler.auth.constants import Scope
-from handler.auth.dependencies import get_permissions
-from handler.database import db_rom_handler, db_save_handler, db_state_handler
+from handler.auth.dependencies import assert_admin, get_permissions
+from handler.database import db_platform_handler, db_rom_handler, db_save_handler, db_state_handler
 from handler.database.base_handler import sync_session
+from config.config_manager import ROMSTOP_HACKS_FOLDER
 from handler.filesystem import fs_asset_handler
 from handler.redis_handler import low_prio_queue
+from handler.romshelf import community as romshelf_community
 from handler.romshelf import counters as romshelf_counters
+from handler.romshelf import ftp as romshelf_ftp
+from handler.romshelf import ftp_send as romshelf_ftp_send
 from handler.romshelf import index as romshelf_index
 from handler.romshelf import installs as romshelf_installs
 from handler.romshelf import modpatch as romshelf_modpatch
@@ -119,11 +123,19 @@ def _installs_by_hack() -> dict[str, list[dict[str, Any]]]:
 
 
 def _install_json(r: dict[str, Any]) -> dict[str, Any]:
-    return {k: r.get(k) for k in ("id", "hack_id", "version", "rom_id", "status", "fs_name", "base_rom_id", "installed_at", "checksum_validated")}
+    return {
+        k: r.get(k)
+        for k in ("id", "hack_id", "version", "rom_id", "status", "fs_name", "base_rom_id", "installed_at", "checksum_validated", "ftp_job")
+    }
+
+
+async def _index() -> dict[str, Any]:
+    """The index with RomStop's own ratings, favs and download counts added."""
+    return await romshelf_community.apply(await romshelf_index.get_index())
 
 
 async def _hack(hack_id: str) -> dict[str, Any]:
-    index = await romshelf_index.get_index()
+    index = await _index()
     hack = index["byId"].get(hack_id)
     if not hack:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"No RomStop hack {hack_id}")
@@ -146,6 +158,7 @@ async def get_status(request: Request) -> dict[str, Any]:
 async def refresh_index(request: Request) -> dict[str, Any]:
     """Fetch the index from the RomStop site now."""
     await romshelf_index.get_index(force=True)
+    romshelf_community.invalidate()
     return _status()
 
 
@@ -182,7 +195,7 @@ def _list_hacks(index: dict[str, Any], can_see: Any, user_id: int) -> dict[str, 
 @protected_route(router.get, "/hacks", [Scope.ROMS_READ])
 async def list_hacks(request: Request) -> dict[str, Any]:
     """Every hack in the index, with how well the library's ROMs fit each one."""
-    index = await romshelf_index.get_index()
+    index = await _index()
     await romshelf_installs.finalize_pending()
     # Reading the library and matching it is blocking work; keep it off the event loop.
     return await asyncio.to_thread(_list_hacks, index, get_permissions(request).can_see_rom, request.user.id)
@@ -246,6 +259,8 @@ def _count_download(hack_id: str) -> None:
         romshelf_counters.add_download(hack_id)
     except sqlite3.Error as exc:  # A count is never worth failing an install over.
         log.warning(f"RomStop: could not count the download of {hack_id}: {exc}")
+    # The site's download counter counts RomM installs too (once per RomM per hack); off with ROMSTOP_SHARE_INSTALLS=0.
+    romshelf_community.report_install(hack_id)
 
 
 # Download servers that turn away automated requests (robots.txt "Disallow: /" or a referrer check).
@@ -319,7 +334,7 @@ def hack_payload(hack: dict[str, Any]) -> dict[str, Any]:
     current = ((hack.get("versions") or [{}])[0]).get("version") or hack.get("version")
     have = list(dict.fromkeys(p.get("version") or current for p in patches if p.get("url")))
     return {
-        **{k: v for k, v in hack.items() if k not in ("patches", "page")},
+        **{k: v for k, v in romshelf_community.public(hack).items() if k not in ("patches", "page")},
         "patchFormats": formats,
         "patchVersions": [v for v in have if v],
         # Mod packages (Wii / Vita) are downloaded by the user: RomStop's mirror first, else the source's file.
@@ -336,7 +351,7 @@ async def get_rom_hacks(request: Request, rom_id: Annotated[int, PathVar(ge=1)])
     if not rom_row or not get_permissions(request).can_see_rom(rom_row):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"ROM {rom_id} not found")
     rom = await asyncio.to_thread(library_rom, rom_id)
-    index = await romshelf_index.get_index()
+    index = await _index()
     await romshelf_installs.finalize_pending()
     installs = _installs_by_hack()
     own_install = next((r for r in romshelf_installs.all_records() if r.get("rom_id") == rom_id), None)
@@ -390,6 +405,9 @@ async def install_hack(
     patch_member: Annotated[str | None, Form(description="Which patch to use when the download holds several.")] = None,
     archive_member: Annotated[str | None, Form(description="File inside a ZIP ROM to patch.")] = None,
     replace: Annotated[bool, Form()] = False,
+    hacks_folder: Annotated[bool, Form(description='Save the hack in a "Hacks" folder inside the platform folder.')] = False,
+    send_ftp: Annotated[bool, Form(description="Send with FTP as soon as the patched file is written.")] = False,
+    ftp_target: Annotated[str | None, Form(description="Which FTP target to send to (the default one when empty).")] = None,
     patch_file: Annotated[UploadFile | None, File(description="The patch or its archive, when the site needs a browser download.")] = None,
 ) -> dict[str, Any]:
     """Download the hack's patch, apply it to one of this ROM's files and add the result to the library as a new ROM.
@@ -425,7 +443,7 @@ async def install_hack(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail={"message": f"{rom_file.file_name} is missing from disk.", "code": "missing_file"})
 
     if method:
-        return await _install_mod(request, hack, chosen, base_rom, rom_file, patch_file, replace, m)
+        return await _install_mod(request, hack, chosen, base_rom, rom_file, patch_file, replace, m, hacks_folder, send_ftp, ftp_target)
 
     work = Path(tempfile.mkdtemp(prefix="romshelf_patch_"))
     try:
@@ -446,6 +464,7 @@ async def install_hack(
             user_id=request.user.id,
             archive_member=archive_member,
             replace=replace,
+            hacks_folder=hacks_folder,
         )
     except (PatchSourceError, romshelf_installs.InstallError) as exc:
         raise _error(exc) from exc
@@ -457,12 +476,13 @@ async def install_hack(
     finally:
         shutil.rmtree(work, ignore_errors=True)
 
+    record = await _send_after_install(record, send_ftp, request.user.id, ftp_target)
     await _scan_then_finalize(request, base_rom.platform_id, record)
     _count_download(hack_id)
     return {**_install_json(record), "needed": needed_rom_label(hack, base), "match": m.level.value}
 
 
-async def _install_mod(request: Request, hack: dict[str, Any], chosen: dict[str, Any] | None, base_rom: Any, rom_file: Any, patch_file: UploadFile | None, replace: bool, m: Match) -> dict[str, Any]:
+async def _install_mod(request: Request, hack: dict[str, Any], chosen: dict[str, Any] | None, base_rom: Any, rom_file: Any, patch_file: UploadFile | None, replace: bool, m: Match, hacks_folder: bool = False, send_ftp: bool = False, ftp_target: str | None = None) -> dict[str, Any]:
     """Wii Riivolution / Vita rePatch: fetch the mod package and lay it over the game (see handler/romshelf/modpatch.py)."""
     work = Path(tempfile.mkdtemp(prefix="romshelf_modsrc_"))
     try:
@@ -471,15 +491,36 @@ async def _install_mod(request: Request, hack: dict[str, Any], chosen: dict[str,
         else:
             package = await _fetch_first(patch_urls(hack, chosen), work)
         record = await romshelf_installs.install_mod(
-            hack=hack, version=chosen, rom_file=rom_file, base_rom=base_rom, package=package, user_id=request.user.id, replace=replace
+            hack=hack,
+            version=chosen,
+            rom_file=rom_file,
+            base_rom=base_rom,
+            package=package,
+            user_id=request.user.id,
+            replace=replace,
+            hacks_folder=hacks_folder,
         )
     except (PatchSourceError, romshelf_installs.InstallError) as exc:
         raise _error(exc) from exc
     finally:
         shutil.rmtree(work, ignore_errors=True)
+    record = await _send_after_install(record, send_ftp, request.user.id, ftp_target)
     await _scan_then_finalize(request, base_rom.platform_id, record)
     _count_download(hack["id"])
     return {**_install_json(record), "needed": needed_rom_label(hack), "match": m.level.value}
+
+
+async def _send_after_install(record: dict[str, Any], send_ftp: bool, user_id: int, ftp_target: str | None = None) -> dict[str, Any]:
+    """Install + Send with FTP: send the patched file now, without waiting for RomM's scan. The two are independent:
+    a send that can't start is recorded with its reason and never fails the install."""
+    if not send_ftp or not romshelf_ftp.status()["enabled"]:
+        return record
+    try:
+        job_id = await asyncio.to_thread(romshelf_ftp_send.send_install_or_record_failure, record, user_id, ftp_target or None)
+    except Exception as exc:
+        log.warning(f"RomStop: could not start sending {record['fs_name']} with FTP: {exc}")
+        return record
+    return romshelf_installs.set_ftp_job(record["id"], job_id) or {**record, "ftp_job": job_id}
 
 
 async def _scan_then_finalize(request: Request, platform_id: int, record: dict[str, Any]) -> None:
@@ -500,6 +541,167 @@ async def get_install(request: Request, record_id: Annotated[str, PathVar()]) ->
     if not record:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Install not found")
     return _install_json(record)
+
+
+# ---------------------------------------------------------------- Send with FTP
+# An admin sets up one FTP target (say a PS5's FTP payload next to RetroArch); anyone who may install hacks can
+# then push a library game to it. The password stays on the server (handler/romshelf/ftp.py).
+
+
+def _ftp_error(exc: romshelf_ftp.FtpError) -> HTTPException:
+    return HTTPException(status_code=exc.status, detail={"message": str(exc), "code": exc.code})
+
+
+@protected_route(router.get, "/ftp/status", [Scope.ROMS_READ])
+async def ftp_status(request: Request) -> dict[str, Any]:
+    """Whether Send with FTP is on, and the target's name for the button."""
+    return romshelf_ftp.status()
+
+
+@protected_route(router.get, "/ftp/settings", [Scope.ROMS_WRITE])
+async def get_ftp_settings(request: Request) -> dict[str, Any]:
+    """The FTP settings for the admin form (never the password) and the presets."""
+    assert_admin(request)
+    return {"settings": romshelf_ftp.public(), "presets": list(romshelf_ftp.iter_presets()), "hacks_folder": ROMSTOP_HACKS_FOLDER}
+
+
+@protected_route(router.put, "/ftp/settings", [Scope.ROMS_WRITE])
+async def put_ftp_settings(request: Request, payload: Annotated[dict[str, Any], Body()]) -> dict[str, Any]:
+    """Save the FTP settings. Leave `password` out to keep the saved one; `clear_password` removes it."""
+    assert_admin(request)
+    try:
+        return {"settings": await asyncio.to_thread(romshelf_ftp.save, payload)}
+    except romshelf_ftp.FtpError as exc:
+        raise _ftp_error(exc) from exc
+
+
+@protected_route(router.post, "/ftp/test", [Scope.ROMS_WRITE])
+async def test_ftp(request: Request, payload: Annotated[dict[str, Any] | None, Body()] = None) -> dict[str, Any]:
+    """Sign in with one target's form settings (unsaved changes included; `id` names a saved target to lay them over)
+    and list the base path's folders."""
+    assert_admin(request)
+    try:
+        settings = romshelf_ftp.merged(payload or {})
+        return await asyncio.to_thread(romshelf_ftp.test, settings)
+    except romshelf_ftp.FtpError as exc:
+        raise _ftp_error(exc) from exc
+
+
+@protected_route(router.post, "/ftp/send", [Scope.ROMS_WRITE])
+async def send_with_ftp(request: Request, payload: Annotated[dict[str, Any], Body()]) -> dict[str, Any]:
+    """Send a library game (`rom_id`) or an installed hack (`install_id`, also before RomM's scan has added it)
+    to an FTP target (`target`, the default one when left out). Returns a job to poll."""
+    target_id = _optional_text(payload, "target")
+    try:
+        if payload.get("install_id"):
+            record = romshelf_installs.get_record(str(payload["install_id"]))
+            if not record or not romshelf_installs.library_path_exists(record):
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Install not found")
+            if not record.get("platform_fs_slug"):  # installs made before Send with FTP
+                platform = db_platform_handler.get_platform(record["platform_id"])
+                record = {**record, "platform_fs_slug": platform.fs_slug if platform else ""}
+            found = await asyncio.to_thread(romshelf_ftp_send.send_install, record, request.user.id, target_id)
+            romshelf_installs.set_ftp_job(record["id"], found["id"])
+            return found
+        rom_id = int(payload.get("rom_id") or 0)
+        rom = db_rom_handler.get_rom(rom_id) if rom_id > 0 else None
+        if not rom or not get_permissions(request).can_see_rom(rom):
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"ROM {rom_id} not found")
+        return await asyncio.to_thread(romshelf_ftp_send.send_rom, rom, request.user.id, target_id)
+    except romshelf_ftp.FtpError as exc:
+        raise _ftp_error(exc) from exc
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Bad send request: {exc}") from None
+
+
+def _ftp_save_asset(request: Request, payload: dict[str, Any]) -> tuple[str, Any, Any]:
+    """The save or state a Send with FTP request names, and its game: the caller's own, or a public one."""
+    kind = payload.get("type")
+    if kind not in ("save", "state"):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="type must be save or state")
+    asset_id = int(payload.get("id") or 0)
+    handler = db_save_handler.get_save_by_id if kind == "save" else db_state_handler.get_state_by_id
+    asset = handler(asset_id) if asset_id > 0 else None
+    if not asset or (asset.user_id != request.user.id and not asset.is_public):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"{kind.capitalize()} {asset_id} not found")
+    rom = db_rom_handler.get_rom(asset.rom_id)
+    if not rom or not get_permissions(request).can_see_rom(rom):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"{kind.capitalize()} {asset_id} not found")
+    return kind, asset, rom
+
+
+def _optional_text(payload: dict[str, Any], key: str) -> str | None:
+    value = payload.get(key)
+    return str(value).strip() or None if value is not None else None
+
+
+@protected_route(router.post, "/ftp/save/plan", [Scope.ASSETS_READ])
+async def plan_save_with_ftp(request: Request, payload: Annotated[dict[str, Any], Body()]) -> dict[str, Any]:
+    """Where a save (`type` save) or save state (`type` state) would go: the folder from the FTP settings, the name
+    on the device, whether that file is already there, and the folders this user typed in before. `folder` and
+    `file_name` check another place instead."""
+    try:
+        kind, asset, rom = _ftp_save_asset(request, payload)
+        return await asyncio.to_thread(
+            romshelf_ftp_send.save_plan,
+            kind,
+            asset,
+            rom,
+            request.user.id,
+            _optional_text(payload, "folder"),
+            _optional_text(payload, "file_name"),
+            _optional_text(payload, "target"),
+        )
+    except romshelf_ftp.FtpError as exc:
+        raise _ftp_error(exc) from exc
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Bad request: {exc}") from None
+
+
+@protected_route(router.post, "/ftp/save/send", [Scope.ASSETS_READ])
+async def send_save_with_ftp(request: Request, payload: Annotated[dict[str, Any], Body()]) -> dict[str, Any]:
+    """Send a save or save state. Without `folder` it goes to the folder from the FTP settings; a `folder` is
+    remembered for this user. A file already there is refused (409, code `exists`) unless `replace` is true, and then
+    it is renamed to `<name>.bak-<time>` before the new one is written. Returns a job to poll."""
+    try:
+        kind, asset, rom = _ftp_save_asset(request, payload)
+        return await asyncio.to_thread(
+            romshelf_ftp_send.send_save,
+            kind,
+            asset,
+            rom,
+            request.user.id,
+            _optional_text(payload, "folder"),
+            _optional_text(payload, "file_name"),
+            bool(payload.get("replace")),
+            _optional_text(payload, "target"),
+        )
+    except romshelf_ftp.FtpError as exc:
+        raise _ftp_error(exc) from exc
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Bad request: {exc}") from None
+
+
+@protected_route(router.get, "/ftp/save-paths", [Scope.ASSETS_READ])
+async def get_ftp_save_paths(request: Request) -> dict[str, Any]:
+    """The device folders this user typed in for saves before, newest first."""
+    return {"paths": await asyncio.to_thread(romshelf_ftp.recent_paths, request.user.id)}
+
+
+@protected_route(router.delete, "/ftp/save-paths", [Scope.ASSETS_READ])
+async def forget_ftp_save_path(request: Request, payload: Annotated[dict[str, Any], Body()]) -> dict[str, Any]:
+    """Drop a remembered folder from this user's list."""
+    await asyncio.to_thread(romshelf_ftp.forget_path, request.user.id, str(payload.get("path") or ""))
+    return {"paths": await asyncio.to_thread(romshelf_ftp.recent_paths, request.user.id)}
+
+
+@protected_route(router.get, "/ftp/jobs/{job_id}", [Scope.ROMS_READ])
+async def get_ftp_job(request: Request, job_id: Annotated[str, PathVar()]) -> dict[str, Any]:
+    """A transfer's progress: status running / done / failed, bytes done of total."""
+    found = await asyncio.to_thread(romshelf_ftp.job, job_id)
+    if not found:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Transfer not found")
+    return found
 
 
 # ---------------------------------------------------------------- save import

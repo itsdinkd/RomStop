@@ -132,6 +132,8 @@ export interface RomshelfInstall {
   base_rom_id: number;
   installed_at: string;
   checksum_validated: boolean;
+  /** The install's latest Send with FTP job (Install + Send with FTP starts one right after patching). */
+  ftp_job?: string | null;
 }
 
 export interface RomshelfLibraryFile {
@@ -258,6 +260,12 @@ export interface RomshelfInstallInput {
   version?: string | null;
   patchMember?: string | null;
   replace?: boolean;
+  /** Save the hack in a "Hacks" folder inside the platform folder. */
+  hacksFolder?: boolean;
+  /** Send with FTP as soon as the patched file is written; independent of RomM's scan. */
+  sendFtp?: boolean;
+  /** Which FTP target to send to after installing; left out uses the default one. */
+  ftpTarget?: string | null;
   patchFile?: File | null;
 }
 
@@ -360,8 +368,185 @@ async function install(input: RomshelfInstallInput) {
   if (input.version) form.append("version", input.version);
   if (input.patchMember) form.append("patch_member", input.patchMember);
   if (input.replace) form.append("replace", "true");
+  if (input.hacksFolder) form.append("hacks_folder", "true");
+  if (input.sendFtp) form.append("send_ftp", "true");
+  if (input.sendFtp && input.ftpTarget)
+    form.append("ftp_target", input.ftpTarget);
   if (input.patchFile) form.append("patch_file", input.patchFile);
   return api.post<RomshelfInstallResult>("/romshelf/install", form);
+}
+
+// ---- Send with FTP. Shapes mirror the /romshelf/ftp routes.
+
+export type FtpHacksMode = "match" | "always" | "never";
+
+export type FtpSavesLayout = "flat" | "core" | "content" | "core_content";
+
+/** One device Send with FTP can send to (a PS5, a handheld...), with its own server, folders and saves settings. */
+export interface FtpTarget {
+  id: string;
+  name: string;
+  preset: string | null;
+  host: string;
+  port: number;
+  username: string;
+  tls: boolean;
+  passive: boolean;
+  base_path: string;
+  /** RomM platform folder (fs_slug) -> folder on the device. */
+  folders: Record<string, string>;
+  hacks: FtpHacksMode;
+  hacks_folder: string;
+  existing: "replace" | "skip";
+  timeout: number;
+  /** RetroArch's saves and states folders on the device ("" when not set). */
+  saves_path: string;
+  states_path: string;
+  /** Subfolders under them, like RetroArch's "sort saves into folders" options. */
+  saves_layout: FtpSavesLayout;
+  /** The password is never sent back; this says whether one is saved. */
+  password_set: boolean;
+}
+
+export interface FtpSettings {
+  enabled: boolean;
+  /** The target sends go to unless the user picks another. */
+  default: string;
+  targets: FtpTarget[];
+}
+
+export type FtpTargetInput = Partial<Omit<FtpTarget, "password_set">> & {
+  /** Left out (or empty) keeps the saved password. */
+  password?: string;
+  clear_password?: boolean;
+};
+
+/** The whole list: a saved target left out is removed. */
+export interface FtpSettingsInput {
+  enabled: boolean;
+  default: string;
+  targets: FtpTargetInput[];
+}
+
+export interface FtpPreset {
+  id: string;
+  label: string;
+  description: string;
+  settings: Partial<FtpTarget>;
+}
+
+export interface FtpStatus {
+  enabled: boolean;
+  /** The default target's name and id; `targets` lists every ready target, the default first. */
+  name: string | null;
+  default: string | null;
+  targets: { id: string; name: string }[];
+}
+
+export interface FtpTestResult {
+  ok: boolean;
+  welcome: string;
+  folders: string[];
+}
+
+export interface FtpJob {
+  id: string;
+  rom_id: number;
+  status: "running" | "done" | "failed";
+  total: number;
+  done: number;
+  current: string | null;
+  message: string | null;
+  code: string | null;
+  sent: number;
+  skipped: number;
+  target: string;
+  target_id: string | null;
+  dest: string;
+}
+
+async function getFtpStatus() {
+  return api.get<FtpStatus>("/romshelf/ftp/status");
+}
+
+async function getFtpSettings() {
+  return api.get<{ settings: FtpSettings; presets: FtpPreset[]; hacks_folder: string }>(
+    "/romshelf/ftp/settings",
+  );
+}
+
+async function saveFtpSettings(input: FtpSettingsInput) {
+  return api.put<{ settings: FtpSettings }>("/romshelf/ftp/settings", input);
+}
+
+async function testFtp(input: FtpTargetInput) {
+  return api.post<FtpTestResult>("/romshelf/ftp/test", input);
+}
+
+/** Send an install (also before RomM's scan has added it) or a library game. */
+async function sendWithFtp(input: {
+  installId?: string | null;
+  romId?: number | null;
+  /** The FTP target's id; left out sends to the default one. */
+  target?: string | null;
+}) {
+  return api.post<FtpJob>("/romshelf/ftp/send", {
+    install_id: input.installId ?? undefined,
+    rom_id: input.romId ?? undefined,
+    target: input.target ?? undefined,
+  });
+}
+
+export type FtpSaveKind = "save" | "state";
+
+/** Where a save or state would go, and whether a file of that name is already there. */
+export interface FtpSavePlan {
+  kind: FtpSaveKind;
+  target: string;
+  target_id: string;
+  console: string;
+  game: string;
+  emulator: string | null;
+  core_dir: string | null;
+  content_dir: string;
+  /** The folder from the FTP settings; null while it isn't set. */
+  settings_dir: string | null;
+  dir: string | null;
+  file_name: string;
+  path: string | null;
+  /** null when it couldn't be checked (see check_error). */
+  exists: boolean | null;
+  check_error: string | null;
+  recent_paths: string[];
+}
+
+export interface FtpSaveRequest {
+  type: FtpSaveKind;
+  id: number;
+  /** A folder typed in by hand; left out uses the settings' folder. */
+  folder?: string | null;
+  file_name?: string | null;
+  /** The FTP target's id; left out uses the default one. */
+  target?: string | null;
+}
+
+async function planSaveWithFtp(input: FtpSaveRequest) {
+  return api.post<FtpSavePlan>("/romshelf/ftp/save/plan", input);
+}
+
+/** A file already there is refused (409, code "exists") unless `replace`; then it is kept as .bak-<time>. */
+async function sendSaveWithFtp(input: FtpSaveRequest & { replace?: boolean }) {
+  return api.post<FtpJob>("/romshelf/ftp/save/send", input);
+}
+
+async function forgetFtpSavePath(path: string) {
+  return api.delete<{ paths: string[] }>("/romshelf/ftp/save-paths", {
+    data: { path },
+  });
+}
+
+async function getFtpJob(jobId: string) {
+  return api.get<FtpJob>(`/romshelf/ftp/jobs/${encodeURIComponent(jobId)}`);
 }
 
 // ---- Save import. Shapes mirror the /romshelf/saves routes.
@@ -510,4 +695,13 @@ export default {
   getSaveImportOptions,
   planSaveImport,
   uploadSaveFile,
+  getFtpStatus,
+  getFtpSettings,
+  saveFtpSettings,
+  testFtp,
+  sendWithFtp,
+  getFtpJob,
+  planSaveWithFtp,
+  sendSaveWithFtp,
+  forgetFtpSavePath,
 };
