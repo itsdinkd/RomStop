@@ -32,6 +32,8 @@ Use `ghcr.io/itsdinkd/romstop-romm:latest` instead of `rommapp/romm` in RomM's u
 | `ROMSTOP_SITE_URL` | `https://romstop.pages.dev/` |
 | `ROMSTOP_INDEX_URL` | `<site>/device/index.json` (a `file://` path works too) |
 | `ROMSTOP_INDEX_TTL_SECONDS` | `600` |
+| `ROMSTOP_COMMUNITY_TTL_SECONDS` | `600` (how often RomStop's ratings, favs and download counts are fetched) |
+| `ROMSTOP_SHARE_INSTALLS` | `1` (set `0` to stop counting your installs on the RomStop site) |
 
 ## Development
 
