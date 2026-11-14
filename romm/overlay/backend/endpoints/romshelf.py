@@ -23,6 +23,7 @@ from handler.database.base_handler import sync_session
 from config.config_manager import ROMSTOP_HACKS_FOLDER
 from handler.filesystem import fs_asset_handler
 from handler.redis_handler import low_prio_queue
+from handler.romshelf import community as romshelf_community
 from handler.romshelf import counters as romshelf_counters
 from handler.romshelf import ftp as romshelf_ftp
 from handler.romshelf import ftp_send as romshelf_ftp_send
@@ -127,8 +128,13 @@ def _install_json(r: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+async def _index() -> dict[str, Any]:
+    """The index with RomStop's own ratings, favs and download counts added."""
+    return await romshelf_community.apply(await romshelf_index.get_index())
+
+
 async def _hack(hack_id: str) -> dict[str, Any]:
-    index = await romshelf_index.get_index()
+    index = await _index()
     hack = index["byId"].get(hack_id)
     if not hack:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"No RomStop hack {hack_id}")
@@ -151,6 +157,7 @@ async def get_status(request: Request) -> dict[str, Any]:
 async def refresh_index(request: Request) -> dict[str, Any]:
     """Fetch the index from the RomStop site now."""
     await romshelf_index.get_index(force=True)
+    romshelf_community.invalidate()
     return _status()
 
 
@@ -187,7 +194,7 @@ def _list_hacks(index: dict[str, Any], can_see: Any, user_id: int) -> dict[str, 
 @protected_route(router.get, "/hacks", [Scope.ROMS_READ])
 async def list_hacks(request: Request) -> dict[str, Any]:
     """Every hack in the index, with how well the library's ROMs fit each one."""
-    index = await romshelf_index.get_index()
+    index = await _index()
     await romshelf_installs.finalize_pending()
     # Reading the library and matching it is blocking work; keep it off the event loop.
     return await asyncio.to_thread(_list_hacks, index, get_permissions(request).can_see_rom, request.user.id)
@@ -251,6 +258,8 @@ def _count_download(hack_id: str) -> None:
         romshelf_counters.add_download(hack_id)
     except sqlite3.Error as exc:  # A count is never worth failing an install over.
         log.warning(f"RomStop: could not count the download of {hack_id}: {exc}")
+    # The site's download counter counts RomM installs too (once per RomM per hack); off with ROMSTOP_SHARE_INSTALLS=0.
+    romshelf_community.report_install(hack_id)
 
 
 # Download servers that turn away automated requests (robots.txt "Disallow: /" or a referrer check).
@@ -324,7 +333,7 @@ def hack_payload(hack: dict[str, Any]) -> dict[str, Any]:
     current = ((hack.get("versions") or [{}])[0]).get("version") or hack.get("version")
     have = list(dict.fromkeys(p.get("version") or current for p in patches if p.get("url")))
     return {
-        **{k: v for k, v in hack.items() if k not in ("patches", "page")},
+        **{k: v for k, v in romshelf_community.public(hack).items() if k not in ("patches", "page")},
         "patchFormats": formats,
         "patchVersions": [v for v in have if v],
         # Mod packages (Wii / Vita) are downloaded by the user: RomStop's mirror first, else the source's file.
@@ -341,7 +350,7 @@ async def get_rom_hacks(request: Request, rom_id: Annotated[int, PathVar(ge=1)])
     if not rom_row or not get_permissions(request).can_see_rom(rom_row):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"ROM {rom_id} not found")
     rom = await asyncio.to_thread(library_rom, rom_id)
-    index = await romshelf_index.get_index()
+    index = await _index()
     await romshelf_installs.finalize_pending()
     installs = _installs_by_hack()
     own_install = next((r for r in romshelf_installs.all_records() if r.get("rom_id") == rom_id), None)
