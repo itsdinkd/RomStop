@@ -63,6 +63,9 @@ const form = reactive<Form>({
   hacks_folder: "Hacks",
   existing: "replace",
   timeout: 30,
+  saves_path: "",
+  states_path: "",
+  saves_layout: "flat",
 });
 const password = ref("");
 const clearPassword = ref(false);
@@ -137,6 +140,22 @@ const existingItems = computed(() => [
   { value: "replace", title: t("romshelf.ftp-existing-replace") },
   { value: "skip", title: t("romshelf.ftp-existing-skip") },
 ]);
+
+const savesLayoutItems = computed(() => [
+  { value: "flat", title: t("romshelf.ftp-saves-layout-flat") },
+  { value: "core", title: t("romshelf.ftp-saves-layout-core") },
+  { value: "content", title: t("romshelf.ftp-saves-layout-content") },
+  { value: "core_content", title: t("romshelf.ftp-saves-layout-core-content") },
+]);
+function saveExample(base: string, file: string) {
+  if (!base) return t("romshelf.ftp-saves-not-set");
+  const parts = [base.replace(/\/+$/, "")];
+  if (form.saves_layout === "core" || form.saves_layout === "core_content")
+    parts.push("Snes9x");
+  if (form.saves_layout === "content" || form.saves_layout === "core_content")
+    parts.push(form.folders["snes"] || "snes");
+  return `${parts.join("/")}/${file}`;
+}
 
 function payload(): FtpSettingsInput {
   const out: FtpSettingsInput = { ...form, folders: { ...form.folders } };
@@ -488,6 +507,49 @@ useUnloadGuard(() => dirty.value);
           />
         </div>
       </div>
+    </SettingsSection>
+
+    <SettingsSection
+      :title="t('romshelf.ftp-saves')"
+      icon="mdi-content-save-move-outline"
+    >
+      <p class="r-v2-rs-ftp-settings__desc">
+        {{ t("romshelf.ftp-saves-desc") }}
+      </p>
+      <div class="r-v2-rs-ftp-settings__grid">
+        <RTextField
+          v-model="form.saves_path"
+          :label="t('romshelf.ftp-saves-path')"
+          placeholder="/data/homebrew/PPSA99169/saves"
+          prefix-label="stacked"
+          hide-details
+        />
+        <RTextField
+          v-model="form.states_path"
+          :label="t('romshelf.ftp-states-path')"
+          placeholder="/data/homebrew/PPSA99169/states"
+          prefix-label="stacked"
+          hide-details
+        />
+        <RSelect
+          v-model="form.saves_layout"
+          :items="savesLayoutItems"
+          item-title="title"
+          item-value="value"
+          :label="t('romshelf.ftp-saves-layout')"
+          prefix-label="stacked"
+          hide-details
+        />
+      </div>
+      <p class="r-v2-rs-ftp-settings__note">
+        <RIcon icon="mdi-information-outline" size="13" />
+        <span>
+          {{ t("romshelf.ftp-saves-example") }}
+          <code>{{ saveExample(form.saves_path, "Game.srm") }}</code
+          >,
+          <code>{{ saveExample(form.states_path, "Game.state1") }}</code>
+        </span>
+      </p>
     </SettingsSection>
 
     <SettingsSaveBar

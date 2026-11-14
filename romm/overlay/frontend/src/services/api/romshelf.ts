@@ -363,6 +363,8 @@ async function install(input: RomshelfInstallInput) {
 
 export type FtpHacksMode = "match" | "always" | "never";
 
+export type FtpSavesLayout = "flat" | "core" | "content" | "core_content";
+
 export interface FtpSettings {
   enabled: boolean;
   name: string;
@@ -379,6 +381,11 @@ export interface FtpSettings {
   hacks_folder: string;
   existing: "replace" | "skip";
   timeout: number;
+  /** RetroArch's saves and states folders on the device ("" when not set). */
+  saves_path: string;
+  states_path: string;
+  /** Subfolders under them, like RetroArch's "sort saves into folders" options. */
+  saves_layout: FtpSavesLayout;
   /** The password is never sent back; this says whether one is saved. */
   password_set: boolean;
 }
@@ -448,6 +455,51 @@ async function sendWithFtp(target: {
   return api.post<FtpJob>("/romshelf/ftp/send", {
     install_id: target.installId ?? undefined,
     rom_id: target.romId ?? undefined,
+  });
+}
+
+export type FtpSaveKind = "save" | "state";
+
+/** Where a save or state would go, and whether a file of that name is already there. */
+export interface FtpSavePlan {
+  kind: FtpSaveKind;
+  target: string;
+  console: string;
+  game: string;
+  emulator: string | null;
+  core_dir: string | null;
+  content_dir: string;
+  /** The folder from the FTP settings; null while it isn't set. */
+  settings_dir: string | null;
+  dir: string | null;
+  file_name: string;
+  path: string | null;
+  /** null when it couldn't be checked (see check_error). */
+  exists: boolean | null;
+  check_error: string | null;
+  recent_paths: string[];
+}
+
+export interface FtpSaveRequest {
+  type: FtpSaveKind;
+  id: number;
+  /** A folder typed in by hand; left out uses the settings' folder. */
+  folder?: string | null;
+  file_name?: string | null;
+}
+
+async function planSaveWithFtp(input: FtpSaveRequest) {
+  return api.post<FtpSavePlan>("/romshelf/ftp/save/plan", input);
+}
+
+/** A file already there is refused (409, code "exists") unless `replace`; then it is kept as .bak-<time>. */
+async function sendSaveWithFtp(input: FtpSaveRequest & { replace?: boolean }) {
+  return api.post<FtpJob>("/romshelf/ftp/save/send", input);
+}
+
+async function forgetFtpSavePath(path: string) {
+  return api.delete<{ paths: string[] }>("/romshelf/ftp/save-paths", {
+    data: { path },
   });
 }
 
@@ -607,4 +659,7 @@ export default {
   testFtp,
   sendWithFtp,
   getFtpJob,
+  planSaveWithFtp,
+  sendSaveWithFtp,
+  forgetFtpSavePath,
 };

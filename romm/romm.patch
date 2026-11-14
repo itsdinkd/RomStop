@@ -194,6 +194,30 @@ index 5ef6c86..03ab8fc 100644
          {
            icon: "mdi-database-cog-outline",
            label: t("scan.metadata-sources"),
+diff --git a/frontend/src/v2/components/shared/AssetActions.vue b/frontend/src/v2/components/shared/AssetActions.vue
+index 19c3499..c679f70 100644
+--- a/frontend/src/v2/components/shared/AssetActions.vue
++++ b/frontend/src/v2/components/shared/AssetActions.vue
+@@ -1,9 +1,11 @@
+ <script setup lang="ts">
+ // The per-item buttons of a save or state row: download for everything, then
+ // edit, favorite and delete for own saves and states.
++// RomStop: own saves and states also get Send with FTP, after the download.
+ import { RBtn } from "@v2/lib";
+ import { computed } from "vue";
+ import { useI18n } from "vue-i18n";
++import SendSaveFtpButton from "@/v2/components/Romshelf/SendSaveFtpButton.vue";
+ import type { Asset, AssetType } from "@/v2/utils/assets";
+ 
+ defineOptions({ inheritAttrs: false });
+@@ -49,6 +51,7 @@ const editLabel = computed(() =>
+       :aria-label="t('rom.download-named', { name: asset.file_name })"
+       @click="emit('download')"
+     />
++    <SendSaveFtpButton v-if="own" :asset="asset" :type="type" />
+     <RBtn
+       v-if="own"
+       icon="mdi-pencil-outline"
 diff --git a/frontend/src/v2/composables/useNavDestinations/index.ts b/frontend/src/v2/composables/useNavDestinations/index.ts
 index 57a34bd..1529d8a 100644
 --- a/frontend/src/v2/composables/useNavDestinations/index.ts

@@ -601,6 +601,79 @@ async def send_with_ftp(request: Request, payload: Annotated[dict[str, Any], Bod
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Bad send request: {exc}") from None
 
 
+def _ftp_save_asset(request: Request, payload: dict[str, Any]) -> tuple[str, Any, Any]:
+    """The save or state a Send with FTP request names, and its game: the caller's own, or a public one."""
+    kind = payload.get("type")
+    if kind not in ("save", "state"):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="type must be save or state")
+    asset_id = int(payload.get("id") or 0)
+    handler = db_save_handler.get_save_by_id if kind == "save" else db_state_handler.get_state_by_id
+    asset = handler(asset_id) if asset_id > 0 else None
+    if not asset or (asset.user_id != request.user.id and not asset.is_public):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"{kind.capitalize()} {asset_id} not found")
+    rom = db_rom_handler.get_rom(asset.rom_id)
+    if not rom or not get_permissions(request).can_see_rom(rom):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"{kind.capitalize()} {asset_id} not found")
+    return kind, asset, rom
+
+
+def _optional_text(payload: dict[str, Any], key: str) -> str | None:
+    value = payload.get(key)
+    return str(value).strip() or None if value is not None else None
+
+
+@protected_route(router.post, "/ftp/save/plan", [Scope.ASSETS_READ])
+async def plan_save_with_ftp(request: Request, payload: Annotated[dict[str, Any], Body()]) -> dict[str, Any]:
+    """Where a save (`type` save) or save state (`type` state) would go: the folder from the FTP settings, the name
+    on the device, whether that file is already there, and the folders this user typed in before. `folder` and
+    `file_name` check another place instead."""
+    try:
+        kind, asset, rom = _ftp_save_asset(request, payload)
+        return await asyncio.to_thread(
+            romshelf_ftp_send.save_plan, kind, asset, rom, request.user.id, _optional_text(payload, "folder"), _optional_text(payload, "file_name")
+        )
+    except romshelf_ftp.FtpError as exc:
+        raise _ftp_error(exc) from exc
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Bad request: {exc}") from None
+
+
+@protected_route(router.post, "/ftp/save/send", [Scope.ASSETS_READ])
+async def send_save_with_ftp(request: Request, payload: Annotated[dict[str, Any], Body()]) -> dict[str, Any]:
+    """Send a save or save state. Without `folder` it goes to the folder from the FTP settings; a `folder` is
+    remembered for this user. A file already there is refused (409, code `exists`) unless `replace` is true, and then
+    it is renamed to `<name>.bak-<time>` before the new one is written. Returns a job to poll."""
+    try:
+        kind, asset, rom = _ftp_save_asset(request, payload)
+        return await asyncio.to_thread(
+            romshelf_ftp_send.send_save,
+            kind,
+            asset,
+            rom,
+            request.user.id,
+            _optional_text(payload, "folder"),
+            _optional_text(payload, "file_name"),
+            bool(payload.get("replace")),
+        )
+    except romshelf_ftp.FtpError as exc:
+        raise _ftp_error(exc) from exc
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Bad request: {exc}") from None
+
+
+@protected_route(router.get, "/ftp/save-paths", [Scope.ASSETS_READ])
+async def get_ftp_save_paths(request: Request) -> dict[str, Any]:
+    """The device folders this user typed in for saves before, newest first."""
+    return {"paths": await asyncio.to_thread(romshelf_ftp.recent_paths, request.user.id)}
+
+
+@protected_route(router.delete, "/ftp/save-paths", [Scope.ASSETS_READ])
+async def forget_ftp_save_path(request: Request, payload: Annotated[dict[str, Any], Body()]) -> dict[str, Any]:
+    """Drop a remembered folder from this user's list."""
+    await asyncio.to_thread(romshelf_ftp.forget_path, request.user.id, str(payload.get("path") or ""))
+    return {"paths": await asyncio.to_thread(romshelf_ftp.recent_paths, request.user.id)}
+
+
 @protected_route(router.get, "/ftp/jobs/{job_id}", [Scope.ROMS_READ])
 async def get_ftp_job(request: Request, job_id: Annotated[str, PathVar()]) -> dict[str, Any]:
     """A transfer's progress: status running / done / failed, bytes done of total."""
