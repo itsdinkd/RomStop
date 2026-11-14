@@ -102,6 +102,11 @@ const savedOnly = computed({
   get: () => q("saved") === "1",
   set: (v: boolean) => setQuery({ saved: v ? "1" : undefined }),
 });
+// Only hacks with a RetroAchievements set; narrows like Saved.
+const raOnly = computed({
+  get: () => q("ra") === "1",
+  set: (v: boolean) => setQuery({ ra: v ? "1" : undefined }),
+});
 const sort = computed<Sort>({
   get: () => (q("sort") as Sort) || "rating",
   set: (v) => setQuery({ sort: v === "rating" ? undefined : v }),
@@ -171,13 +176,18 @@ const types = computed(() =>
 );
 
 const PLAYABLE: RomshelfMatchLevel[] = ["exact", "likely"];
+function achievementsLabel(h: RomshelfHackSummary) {
+  const n = h.achievements?.count;
+  return n ? t("romshelf.achievements-count", { n }) : t("romshelf.achievements");
+}
 function norm(s: string) {
   return s.toLowerCase().normalize("NFKD").replace(/[^a-z0-9]+/g, " ");
 }
 // Saved narrows everything else, including the Show counts.
 const pool = computed(() =>
-  savedOnly.value ? hacks.value.filter((h) => h.saved) : hacks.value,
+  hacks.value.filter((h) => (!savedOnly.value || h.saved) && (!raOnly.value || h.achievements)),
 );
+const raCount = computed(() => hacks.value.filter((h) => h.achievements).length);
 const savedCount = computed(() => hacks.value.filter((h) => h.saved).length);
 const filtered = computed(() => {
   const needle = norm(search.value).trim();
@@ -213,7 +223,7 @@ const filtered = computed(() => {
 const PAGE_SIZE = 120;
 const shownCount = ref(PAGE_SIZE);
 const shown = computed(() => filtered.value.slice(0, shownCount.value));
-watch([search, consoleId, hackType, show, savedOnly, sort], () => (shownCount.value = PAGE_SIZE));
+watch([search, consoleId, hackType, show, savedOnly, raOnly, sort], () => (shownCount.value = PAGE_SIZE));
 const moreSentinel = ref<HTMLElement | null>(null);
 useIntersectionObserver(
   moreSentinel,
@@ -362,6 +372,17 @@ const indexDate = computed(() => {
         >
           {{ t("romshelf.show-saved", { n: savedCount }) }}
         </RBtn>
+        <RBtn
+          v-if="raCount"
+          size="small"
+          variant="outlined"
+          :active="raOnly"
+          :prepend-icon="raOnly ? 'mdi-trophy' : 'mdi-trophy-outline'"
+          :title="t('romshelf.show-achievements-hint')"
+          @click="raOnly = !raOnly"
+        >
+          {{ t("romshelf.show-achievements", { n: raCount }) }}
+        </RBtn>
         <RSelect
           v-model="hackType"
           :items="types"
@@ -451,6 +472,14 @@ const indexDate = computed(() => {
             />
             {{ h.type }}
             <template v-if="h.version"> · {{ h.version }}</template>
+            <span
+              v-if="h.achievements"
+              class="r-v2-rs-card__ra"
+              :title="achievementsLabel(h)"
+            >
+              <RIcon icon="mdi-trophy" size="12" />{{ h.achievements.count ?? "" }}
+              <span class="r-v2-rs-sr">{{ achievementsLabel(h) }}</span>
+            </span>
             <span v-if="h.rating?.score" class="r-v2-rs-card__rating">
               <RIcon icon="mdi-star" size="12" /> {{ h.rating.score.toFixed(1) }}
             </span>
@@ -492,6 +521,14 @@ const indexDate = computed(() => {
               :show-tooltip="false"
             />
             <span class="r-v2-rs-line__type">{{ h.type }}</span>
+            <span
+              v-if="h.achievements"
+              class="r-v2-rs-card__ra"
+              :title="achievementsLabel(h)"
+            >
+              <RIcon icon="mdi-trophy" size="12" />{{ h.achievements.count ?? "" }}
+              <span class="r-v2-rs-sr">{{ achievementsLabel(h) }}</span>
+            </span>
             <span v-if="h.rating?.score" class="r-v2-rs-card__rating">
               <RIcon icon="mdi-star" size="12" /> {{ h.rating.score.toFixed(1) }}
             </span>
@@ -697,6 +734,12 @@ html[data-bp~="sm-and-down"] .r-v2-rs-card__save {
   gap: var(--r-space-1);
   color: var(--r-color-fg-muted);
   font-size: var(--r-font-size-xs);
+}
+.r-v2-rs-card__ra {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  color: var(--r-color-romm-gold);
 }
 .r-v2-rs-card__rating {
   margin-left: auto;
